@@ -459,48 +459,48 @@ string b_reasons = ""
 // (1) Market Structure: BOS bullish (+2) or CHoCH bullish (+3)
 if bull_structure
     b_score += 2
-    b_reasons += "BOS+2 "
+    b_reasons := b_reasons +"BOS+2 "
 else if bull_choch
     b_score += 3
-    b_reasons += "CHoCH+3 "
+    b_reasons := b_reasons +"CHoCH+3 "
 
 // (2) Price at Bullish FVG (+2)
 if bull_fvg_live and bull_fvg_retest
     b_score += 2
-    b_reasons += "FVG+2 "
+    b_reasons := b_reasons +"FVG+2 "
 
 // (3) Price at Bullish Order Block (+2)
 if at_bull_ob
     b_score += 2
-    b_reasons += "OB+2 "
+    b_reasons := b_reasons +"OB+2 "
 
 // (4) Volume Profile: at VAL/POC (+2)
 if at_vp_val
     b_score += 2
-    b_reasons += "VPVAL+2 "
+    b_reasons := b_reasons +"VPVAL+2 "
 else if at_vp_poc
     b_score += 1
-    b_reasons += "VPPOC+1 "
+    b_reasons := b_reasons +"VPPOC+1 "
 
 // (5) VWAP: price above VWAP (+1)
 if close > vwap_val
     b_score += 1
-    b_reasons += "VWAP+1 "
+    b_reasons := b_reasons +"VWAP+1 "
 
 // (6) Volume Imbalance: bullish (+1)
 if bullish_imbalance
     b_score += 1
-    b_reasons += "VOL+1 "
+    b_reasons := b_reasons +"VOL+1 "
 
 // (7) Institutional Candle: bullish (+1)
 if bull_inst
     b_score += 1
-    b_reasons += "INST+1 "
+    b_reasons := b_reasons +"INST+1 "
 
 // (8) Liquidity Sweep: buy side (+1)
 if recent_buy_sweep
     b_score += 1
-    b_reasons += "LIQ+1 "
+    b_reasons := b_reasons +"LIQ+1 "
 
 
 // --- SELL SCORING (8 factors, max 13 points) ---
@@ -509,41 +509,41 @@ string s_reasons = ""
 
 if bear_structure
     s_score += 2
-    s_reasons += "BOS+2 "
+    s_reasons := s_reasons +"BOS+2 "
 else if bear_choch
     s_score += 3
-    s_reasons += "CHoCH+3 "
+    s_reasons := s_reasons +"CHoCH+3 "
 
 if bear_fvg_live and bear_fvg_retest
     s_score += 2
-    s_reasons += "FVG+2 "
+    s_reasons := s_reasons +"FVG+2 "
 
 if at_bear_ob
     s_score += 2
-    s_reasons += "OB+2 "
+    s_reasons := s_reasons +"OB+2 "
 
 if at_vp_vah
     s_score += 2
-    s_reasons += "VPVAH+2 "
+    s_reasons := s_reasons +"VPVAH+2 "
 else if at_vp_poc
     s_score += 1
-    s_reasons += "VPPOC+1 "
+    s_reasons := s_reasons +"VPPOC+1 "
 
 if close < vwap_val
     s_score += 1
-    s_reasons += "VWAP+1 "
+    s_reasons := s_reasons +"VWAP+1 "
 
 if bearish_imbalance
     s_score += 1
-    s_reasons += "VOL+1 "
+    s_reasons := s_reasons +"VOL+1 "
 
 if bear_inst
     s_score += 1
-    s_reasons += "INST+1 "
+    s_reasons := s_reasons +"INST+1 "
 
 if recent_sell_sweep
     s_score += 1
-    s_reasons += "LIQ+1 "
+    s_reasons := s_reasons +"LIQ+1 "
 
 
 // --- SIGNAL GENERATION ---
