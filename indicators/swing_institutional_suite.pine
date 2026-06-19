@@ -1,0 +1,599 @@
+//@version=5
+// ============================================================================
+//  INSTITUTIONAL SWING SUITE (ISS)
+//  Smart-Money Concepts + Volume Profile + Imbalance + VWAP confluence engine
+//  Built for swing trading (Stocks / Indices defaults)
+//
+//  WHAT IT DOES
+//  ------------
+//  Reads a chart the way desks do, then collapses it into ONE confluence
+//  score instead of firing off a single pattern:
+//    1. Market Structure   -> trend bias (BOS / CHoCH) + Higher-Timeframe filter
+//    2. Premium / Discount  -> buy in discount, sell in premium (OTE zone)
+//    3. Fair Value Gaps     -> price imbalance / inefficiency (multi-zone)
+//    4. Order Blocks        -> last opposing candle before displacement
+//    5. Liquidity           -> equal highs/lows + stop-hunt sweeps
+//    6. Volume Profile      -> POC / Value Area High-Low (fixed lookback)
+//    7. Anchored VWAP       -> session VWAP + standard-deviation bands
+//    8. Relative Volume     -> displacement / participation confirmation
+//
+//  A BUY/SELL is flagged only when enough of these AGREE (weighted score)
+//  AND the mandatory gates pass (bias + location + a real institutional zone).
+//  Signals confirm on bar close. Pivots confirm after `Pivot Length` bars.
+//  No indicator is "perfect" — read the dashboard, size risk, and backtest.
+// ============================================================================
+indicator("Institutional Swing Suite", "ISS", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// ============================================================================
+// GROUPS
+// ============================================================================
+var string G_MS   = "1 · Market Structure / Bias"
+var string G_PD   = "2 · Premium / Discount"
+var string G_FVG  = "3 · Fair Value Gaps (Imbalance)"
+var string G_OB   = "4 · Order Blocks"
+var string G_LIQ  = "5 · Liquidity"
+var string G_VP   = "6 · Volume Profile"
+var string G_VWAP = "7 · VWAP"
+var string G_VOL  = "8 · Volume / Confirmation"
+var string G_SIG  = "9 · Signals / Risk"
+var string G_DISP = "Display"
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+// Market structure
+i_pivot_len = input.int(8, "Swing Pivot Length", group = G_MS, minval = 2, tooltip = "Bars left/right to confirm a swing. Larger = fewer, stronger structure points.")
+i_use_htf   = input.bool(true, "Use Higher-Timeframe Bias Filter", group = G_MS)
+i_htf       = input.timeframe("D", "Higher-Timeframe", group = G_MS, tooltip = "Bias must agree with this timeframe's EMA trend. For a 1H chart, D or W is typical.")
+i_htf_ema   = input.int(50, "HTF Trend EMA", group = G_MS, minval = 10)
+
+// Premium / Discount
+i_pd_on     = input.bool(true, "Show Premium/Discount + OTE", group = G_PD)
+
+// FVG
+i_show_fvg   = input.bool(true,  "Show FVG Boxes", group = G_FVG)
+i_fvg_atr    = input.float(0.25, "Min FVG Size (x ATR)", group = G_FVG, minval = 0.0, step = 0.05, tooltip = "Filters tiny gaps. Only displacement-grade imbalances count.")
+i_fvg_expiry = input.int(120,    "FVG Max Age (bars)", group = G_FVG, minval = 10)
+i_max_zones  = input.int(8,      "Max Live Zones (each type)", group = G_FVG, minval = 1, maxval = 30)
+
+// Order Blocks
+i_show_ob   = input.bool(true, "Show Order Block Boxes", group = G_OB)
+i_ob_search = input.int(7,     "OB Lookback (candles before impulse)", group = G_OB, minval = 2, maxval = 20)
+i_ob_expiry = input.int(120,   "OB Max Age (bars)", group = G_OB, minval = 10)
+
+// Liquidity
+i_show_liq  = input.bool(true, "Show Liquidity Levels & Sweeps", group = G_LIQ)
+i_liq_len   = input.int(20,    "Liquidity Lookback", group = G_LIQ, minval = 5)
+i_eq_atr    = input.float(0.1, "Equal H/L Tolerance (x ATR)", group = G_LIQ, minval = 0.01, step = 0.05)
+i_sweep_win = input.int(5,     "Sweep Recency Window (bars)", group = G_LIQ, minval = 1, maxval = 15)
+
+// Volume Profile
+i_vp_on       = input.bool(true,  "Show Volume Profile (POC / VA)", group = G_VP)
+i_vp_lookback = input.int(200,    "VP Lookback (bars)", group = G_VP, minval = 20, maxval = 1000)
+i_vp_rows     = input.int(60,     "VP Resolution (rows)", group = G_VP, minval = 10, maxval = 150)
+i_vp_va       = input.float(70.0, "Value Area %", group = G_VP, minval = 50, maxval = 95, step = 5)
+
+// VWAP
+i_vwap_on   = input.bool(true,  "Show Anchored VWAP + Bands", group = G_VWAP)
+i_vwap_anc  = input.string("Session", "VWAP Anchor", options = ["Session", "Week", "Month"], group = G_VWAP)
+i_vwap_mult = input.float(2.0, "Band Std-Dev Multiplier", group = G_VWAP, minval = 0.5, step = 0.5)
+
+// Volume
+i_vol_len  = input.int(20,    "Volume MA Length", group = G_VOL, minval = 2)
+i_rvol_thr = input.float(1.3, "High-Volume Threshold (x avg)", group = G_VOL, minval = 1.0, step = 0.1)
+
+// Signals / Risk
+i_buy_thr   = input.int(7, "Min Score to Trigger (of 13)", group = G_SIG, minval = 4, maxval = 13)
+i_sl_atr    = input.float(0.5, "Stop Buffer (x ATR)", group = G_SIG, minval = 0.0, step = 0.1)
+i_tp1_rr    = input.float(1.0, "Take-Profit 1 (R multiple)", group = G_SIG, minval = 0.5, step = 0.5)
+i_tp2_rr    = input.float(2.0, "Take-Profit 2 (R multiple)", group = G_SIG, minval = 0.5, step = 0.5)
+i_draw_risk = input.bool(true, "Draw Entry / SL / TP on signal", group = G_SIG)
+
+// Display
+i_show_lbl   = input.bool(true, "Show Signal Labels", group = G_DISP)
+i_show_panel = input.bool(true, "Show Dashboard", group = G_DISP)
+i_show_struc = input.bool(true, "Show BOS / CHoCH labels", group = G_DISP)
+
+// ============================================================================
+// CORE SERIES
+// ============================================================================
+atr         = ta.atr(14)
+avg_vol     = ta.sma(volume, i_vol_len)
+rvol        = avg_vol > 0 ? volume / avg_vol : 0.0
+hi_vol      = rvol > i_rvol_thr
+bull_candle = close > open
+bear_candle = close < open
+
+// ============================================================================
+// 1 · MARKET STRUCTURE -> BIAS (BOS / CHoCH)
+// ============================================================================
+ph = ta.pivothigh(i_pivot_len, i_pivot_len)
+pl = ta.pivotlow(i_pivot_len, i_pivot_len)
+
+var float last_ph = na
+var float last_pl = na
+var float prev_ph = na
+var float prev_pl = na
+
+if not na(ph)
+    prev_ph := last_ph
+    last_ph := ph
+if not na(pl)
+    prev_pl := last_pl
+    last_pl := pl
+
+var float up_level = na   // swing high that, if broken, = bullish break
+var float dn_level = na   // swing low  that, if broken, = bearish break
+var int   bias     = 0    // 1 bull, -1 bear, 0 neutral
+
+if not na(ph)
+    up_level := ph
+if not na(pl)
+    dn_level := pl
+
+bool bos_up   = false
+bool bos_dn   = false
+bool choch_up = false
+bool choch_dn = false
+
+if not na(up_level) and close > up_level
+    choch_up := bias < 0
+    bos_up   := bias >= 0
+    bias     := 1
+    up_level := na
+if not na(dn_level) and close < dn_level
+    choch_dn := bias > 0
+    bos_dn   := bias <= 0
+    bias     := -1
+    dn_level := na
+
+bull_bias = bias == 1
+bear_bias = bias == -1
+
+if i_show_struc and barstate.isconfirmed
+    if choch_up
+        label.new(bar_index, low, "CHoCH", style = label.style_label_up, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+    else if bos_up
+        label.new(bar_index, low, "BOS", style = label.style_label_up, color = color.new(color.teal, 40), textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+    if choch_dn
+        label.new(bar_index, high, "CHoCH", style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+    else if bos_dn
+        label.new(bar_index, high, "BOS", style = label.style_label_down, color = color.new(color.maroon, 40), textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+
+// Higher-timeframe bias filter
+htf_ema_v = request.security(syminfo.tickerid, i_htf, ta.ema(close, i_htf_ema), lookahead = barmerge.lookahead_off)
+htf_close = request.security(syminfo.tickerid, i_htf, close, lookahead = barmerge.lookahead_off)
+htf_bull  = na(htf_close) or na(htf_ema_v) ? true : htf_close > htf_ema_v
+htf_bear  = na(htf_close) or na(htf_ema_v) ? true : htf_close < htf_ema_v
+
+// ============================================================================
+// 2 · PREMIUM / DISCOUNT (dealing range + equilibrium + OTE)
+// ============================================================================
+dr_valid = not na(last_ph) and not na(last_pl) and last_ph > last_pl
+dr_hi    = dr_valid ? last_ph : na
+dr_lo    = dr_valid ? last_pl : na
+eq       = dr_valid ? (dr_hi + dr_lo) / 2.0 : na
+discount = dr_valid and close < eq
+premium  = dr_valid and close > eq
+
+var line eq_line = na
+if i_pd_on and dr_valid and barstate.islast
+    line.delete(eq_line)
+    eq_line := line.new(bar_index - 40, eq, bar_index + 10, eq, color = color.new(color.gray, 30), style = line.style_dotted, width = 1)
+
+// ============================================================================
+// 3 · FAIR VALUE GAPS (multi-zone imbalance with displacement filter)
+//     Bullish FVG : low  > high[2]   (gap up)
+//     Bearish FVG : high < low[2]    (gap down)
+// ============================================================================
+min_gap  = atr * i_fvg_atr
+bull_fvg = low > high[2] and (low - high[2]) > min_gap
+bear_fvg = high < low[2] and (low[2] - high) > min_gap
+
+var array<float> fvgTop = array.new_float()
+var array<float> fvgBot = array.new_float()
+var array<int>   fvgDir = array.new_int()
+var array<int>   fvgBar = array.new_int()
+var array<box>   fvgBox = array.new_box()
+
+bool  in_bull_fvg = false
+bool  in_bear_fvg = false
+float bull_fvg_lo = na
+float bear_fvg_hi = na
+
+if array.size(fvgTop) > 0
+    for i = array.size(fvgTop) - 1 to 0
+        t  = array.get(fvgTop, i)
+        b  = array.get(fvgBot, i)
+        d  = array.get(fvgDir, i)
+        bi = array.get(fvgBar, i)
+        mitigated = d == 1 ? close < b : close > t
+        expired   = (bar_index - bi) > i_fvg_expiry
+        if mitigated or expired
+            box.delete(array.get(fvgBox, i))
+            array.remove(fvgTop, i)
+            array.remove(fvgBot, i)
+            array.remove(fvgDir, i)
+            array.remove(fvgBar, i)
+            array.remove(fvgBox, i)
+        else
+            box.set_right(array.get(fvgBox, i), bar_index + 5)
+            touched = low <= t and high >= b
+            if touched and d == 1
+                in_bull_fvg := true
+                bull_fvg_lo := b
+            if touched and d == -1
+                in_bear_fvg := true
+                bear_fvg_hi := t
+
+f_push_fvg(_t, _b, _d) =>
+    array.push(fvgTop, _t)
+    array.push(fvgBot, _b)
+    array.push(fvgDir, _d)
+    array.push(fvgBar, bar_index)
+    show     = i_show_fvg
+    bdcol    = _d == 1 ? color.new(color.green, show ? 40 : 100) : color.new(color.red, show ? 40 : 100)
+    bxcol    = _d == 1 ? color.new(color.green, show ? 82 : 100) : color.new(color.red, show ? 82 : 100)
+    bx       = box.new(bar_index - 2, _t, bar_index + 5, _b, border_color = bdcol, border_width = 1, bgcolor = bxcol)
+    array.push(fvgBox, bx)
+    if array.size(fvgTop) > i_max_zones
+        box.delete(array.get(fvgBox, 0))
+        array.remove(fvgTop, 0)
+        array.remove(fvgBot, 0)
+        array.remove(fvgDir, 0)
+        array.remove(fvgBar, 0)
+        array.remove(fvgBox, 0)
+
+if bull_fvg
+    f_push_fvg(low, high[2], 1)
+if bear_fvg
+    f_push_fvg(low[2], high, -1)
+
+// ============================================================================
+// 4 · ORDER BLOCKS (last opposing candle before displacement)
+// ============================================================================
+f_find_ob(_dir) =>
+    float oh = na
+    float ol = na
+    for j = 2 to i_ob_search
+        opp = _dir == 1 ? close[j] < open[j] : close[j] > open[j]
+        if opp and na(oh)
+            oh := high[j]
+            ol := low[j]
+    [oh, ol]
+
+var array<float> obTop = array.new_float()
+var array<float> obBot = array.new_float()
+var array<int>   obDir = array.new_int()
+var array<int>   obBar = array.new_int()
+var array<box>   obBox = array.new_box()
+
+bool  in_bull_ob = false
+bool  in_bear_ob = false
+float bull_ob_lo = na
+float bear_ob_hi = na
+
+if array.size(obTop) > 0
+    for i = array.size(obTop) - 1 to 0
+        t  = array.get(obTop, i)
+        b  = array.get(obBot, i)
+        d  = array.get(obDir, i)
+        bi = array.get(obBar, i)
+        mitigated = d == 1 ? close < b : close > t
+        expired   = (bar_index - bi) > i_ob_expiry
+        if mitigated or expired
+            box.delete(array.get(obBox, i))
+            array.remove(obTop, i)
+            array.remove(obBot, i)
+            array.remove(obDir, i)
+            array.remove(obBar, i)
+            array.remove(obBox, i)
+        else
+            box.set_right(array.get(obBox, i), bar_index + 5)
+            touched = low <= t and high >= b
+            if touched and d == 1
+                in_bull_ob := true
+                bull_ob_lo := b
+            if touched and d == -1
+                in_bear_ob := true
+                bear_ob_hi := t
+
+f_push_ob(_t, _b, _d) =>
+    if not na(_t) and not na(_b)
+        array.push(obTop, _t)
+        array.push(obBot, _b)
+        array.push(obDir, _d)
+        array.push(obBar, bar_index)
+        show  = i_show_ob
+        bdcol = _d == 1 ? color.new(color.blue, show ? 30 : 100) : color.new(color.orange, show ? 30 : 100)
+        bxcol = _d == 1 ? color.new(color.blue, show ? 85 : 100) : color.new(color.orange, show ? 85 : 100)
+        bx    = box.new(bar_index - i_ob_search, _t, bar_index + 5, _b, border_color = bdcol, border_width = 1, bgcolor = bxcol)
+        array.push(obBox, bx)
+        if array.size(obTop) > i_max_zones
+            box.delete(array.get(obBox, 0))
+            array.remove(obTop, 0)
+            array.remove(obBot, 0)
+            array.remove(obDir, 0)
+            array.remove(obBar, 0)
+            array.remove(obBox, 0)
+
+if bull_fvg
+    [obh, obl] = f_find_ob(1)
+    f_push_ob(obh, obl, 1)
+if bear_fvg
+    [obh2, obl2] = f_find_ob(-1)
+    f_push_ob(obh2, obl2, -1)
+
+// ============================================================================
+// 5 · LIQUIDITY (equal highs/lows + stop-hunt sweeps)
+// ============================================================================
+liq_hi = ta.highest(high[1], i_liq_len)
+liq_lo = ta.lowest(low[1],   i_liq_len)
+
+sell_sweep = high > liq_hi and close < liq_hi   // buy-side liquidity grabbed -> bearish
+buy_sweep  = low  < liq_lo and close > liq_lo    // sell-side liquidity grabbed -> bullish
+
+bool recent_sell_sweep = false
+bool recent_buy_sweep  = false
+for k = 0 to i_sweep_win - 1
+    if sell_sweep[k]
+        recent_sell_sweep := true
+    if buy_sweep[k]
+        recent_buy_sweep := true
+
+eqh = not na(ph) and not na(prev_ph) and math.abs(ph - prev_ph) <= atr * i_eq_atr
+eql = not na(pl) and not na(prev_pl) and math.abs(pl - prev_pl) <= atr * i_eq_atr
+
+if i_show_liq and eqh
+    line.new(bar_index - i_pivot_len, ph, bar_index + 10, ph, color = color.new(color.red, 20), style = line.style_dashed, width = 1)
+if i_show_liq and eql
+    line.new(bar_index - i_pivot_len, pl, bar_index + 10, pl, color = color.new(color.green, 20), style = line.style_dashed, width = 1)
+if i_show_liq and sell_sweep
+    label.new(bar_index, high, "x", style = label.style_label_down, color = color.new(color.red, 30), textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+if i_show_liq and buy_sweep
+    label.new(bar_index, low, "o", style = label.style_label_up, color = color.new(color.green, 30), textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+
+// ============================================================================
+// 6 · VOLUME PROFILE (fixed lookback, computed on last bar)
+// ============================================================================
+var line  poc_line  = na
+var line  vah_line  = na
+var line  val_line  = na
+var label poc_lbl   = na
+var float poc_price = na
+var float vah_price = na
+var float val_price = na
+
+if barstate.islast and i_vp_on
+    float hh  = ta.highest(high, i_vp_lookback)
+    float ll  = ta.lowest(low,   i_vp_lookback)
+    float rng = hh - ll
+    if not na(rng) and rng > 0
+        int rows   = i_vp_rows
+        float step = rng / rows
+        array<float> bins = array.new_float(rows, 0.0)
+        for k = 0 to i_vp_lookback - 1
+            float bl = low[k]
+            float bh = high[k]
+            float bv = volume[k]
+            if not na(bl) and not na(bh) and not na(bv)
+                int loi  = int(math.max(0, math.min(rows - 1, int(math.floor((bl - ll) / step)))))
+                int hii  = int(math.max(0, math.min(rows - 1, int(math.floor((bh - ll) / step)))))
+                int span = hii - loi + 1
+                float per = bv / span
+                for bi2 = loi to hii
+                    array.set(bins, bi2, array.get(bins, bi2) + per)
+        int   poc_idx = 0
+        float max_v   = 0.0
+        float total_v = 0.0
+        for bi2 = 0 to rows - 1
+            float v = array.get(bins, bi2)
+            total_v += v
+            if v > max_v
+                max_v   := v
+                poc_idx := bi2
+        float va_target = total_v * i_vp_va / 100.0
+        float acc = max_v
+        int up = poc_idx
+        int dn = poc_idx
+        while acc < va_target and (up < rows - 1 or dn > 0)
+            float up_v = up < rows - 1 ? array.get(bins, up + 1) : -1.0
+            float dn_v = dn > 0 ? array.get(bins, dn - 1) : -1.0
+            if up_v >= dn_v
+                up += 1
+                acc += math.max(up_v, 0)
+            else
+                dn -= 1
+                acc += math.max(dn_v, 0)
+        poc_price := ll + (poc_idx + 0.5) * step
+        vah_price := ll + (up + 1) * step
+        val_price := ll + dn * step
+        int lft = bar_index - i_vp_lookback
+        line.delete(poc_line)
+        line.delete(vah_line)
+        line.delete(val_line)
+        label.delete(poc_lbl)
+        poc_line := line.new(lft, poc_price, bar_index + 5, poc_price, color = color.new(color.red, 0), width = 2)
+        vah_line := line.new(lft, vah_price, bar_index + 5, vah_price, color = color.new(color.blue, 20), style = line.style_dashed, width = 1)
+        val_line := line.new(lft, val_price, bar_index + 5, val_price, color = color.new(color.blue, 20), style = line.style_dashed, width = 1)
+        poc_lbl  := label.new(bar_index + 5, poc_price, "POC", style = label.style_label_left, color = color.new(color.red, 30), textcolor = color.white, size = size.tiny)
+
+vp_buy_support = not na(val_price) and not na(poc_price) and close >= val_price and close <= poc_price
+vp_sel_resist  = not na(vah_price) and not na(poc_price) and close <= vah_price and close >= poc_price
+
+// ============================================================================
+// 7 · ANCHORED VWAP + STD-DEV BANDS (manual, robust)
+// ============================================================================
+anc_tf = i_vwap_anc == "Week" ? "W" : i_vwap_anc == "Month" ? "M" : "D"
+anc_t  = time(anc_tf)
+is_new = na(anc_t[1]) or anc_t != anc_t[1]
+src    = hlc3
+var float sumPV  = 0.0
+var float sumV   = 0.0
+var float sumPV2 = 0.0
+sumPV  := (is_new ? 0.0 : sumPV)  + src * volume
+sumV   := (is_new ? 0.0 : sumV)   + volume
+sumPV2 := (is_new ? 0.0 : sumPV2) + src * src * volume
+vwap_v   = sumV > 0 ? sumPV / sumV : na
+variance = sumV > 0 ? math.max(sumPV2 / sumV - vwap_v * vwap_v, 0.0) : 0.0
+vwap_dev = math.sqrt(variance)
+vwap_up  = vwap_v + vwap_dev * i_vwap_mult
+vwap_dn  = vwap_v - vwap_dev * i_vwap_mult
+
+plot(i_vwap_on ? vwap_v : na, "VWAP", color = color.new(color.purple, 0), linewidth = 2)
+p_up = plot(i_vwap_on ? vwap_up : na, "VWAP +Band", color = color.new(color.purple, 60))
+p_dn = plot(i_vwap_on ? vwap_dn : na, "VWAP -Band", color = color.new(color.purple, 60))
+fill(p_up, p_dn, color = i_vwap_on ? color.new(color.purple, 93) : color.new(color.purple, 100))
+
+// ============================================================================
+// 8 · CONFLUENCE SCORING ENGINE (weighted, max 13)
+// ============================================================================
+b_bias  = bull_bias                          ? 2 : 0
+b_htf   = (not i_use_htf or htf_bull)        ? 1 : 0
+b_loc   = discount                           ? 1 : 0
+b_fvg   = in_bull_fvg                         ? 2 : 0
+b_ob    = in_bull_ob                          ? 2 : 0
+b_sweep = recent_buy_sweep                    ? 2 : 0
+b_vwap  = (close > vwap_v or close <= vwap_dn) ? 1 : 0
+b_vp    = vp_buy_support                      ? 1 : 0
+b_conf  = (hi_vol and bull_candle)            ? 1 : 0
+buy_score = b_bias + b_htf + b_loc + b_fvg + b_ob + b_sweep + b_vwap + b_vp + b_conf
+
+s_bias  = bear_bias                          ? 2 : 0
+s_htf   = (not i_use_htf or htf_bear)        ? 1 : 0
+s_loc   = premium                            ? 1 : 0
+s_fvg   = in_bear_fvg                         ? 2 : 0
+s_ob    = in_bear_ob                          ? 2 : 0
+s_sweep = recent_sell_sweep                   ? 2 : 0
+s_vwap  = (close < vwap_v or close >= vwap_up) ? 1 : 0
+s_vp    = vp_sel_resist                       ? 1 : 0
+s_conf  = (hi_vol and bear_candle)            ? 1 : 0
+sell_score = s_bias + s_htf + s_loc + s_fvg + s_ob + s_sweep + s_vwap + s_vp + s_conf
+
+buy_gate  = bull_bias and (in_bull_fvg or in_bull_ob) and (not i_use_htf or htf_bull) and discount
+sell_gate = bear_bias and (in_bear_fvg or in_bear_ob) and (not i_use_htf or htf_bear) and premium
+
+buy_ok  = buy_gate  and buy_score  >= i_buy_thr
+sell_ok = sell_gate and sell_score >= i_buy_thr
+
+f_grade(_s) => _s >= 11 ? "A+" : _s >= 9 ? "A" : _s >= 7 ? "B" : "C"
+
+buy_trig  = buy_ok  and not buy_ok[1]
+sell_trig = sell_ok and not sell_ok[1]
+
+// ============================================================================
+// RISK MODEL (entry / stop / targets)
+// ============================================================================
+recent_low  = ta.lowest(low,  i_pivot_len)
+recent_high = ta.highest(high, i_pivot_len)
+
+buy_entry = close
+buy_stop  = math.min(math.min(recent_low, nz(bull_ob_lo, recent_low)), nz(bull_fvg_lo, recent_low)) - atr * i_sl_atr
+buy_risk  = buy_entry - buy_stop
+buy_tp1   = buy_entry + buy_risk * i_tp1_rr
+buy_tp2   = buy_entry + buy_risk * i_tp2_rr
+
+sell_entry = close
+sell_stop  = math.max(math.max(recent_high, nz(bear_ob_hi, recent_high)), nz(bear_fvg_hi, recent_high)) + atr * i_sl_atr
+sell_risk  = sell_stop - sell_entry
+sell_tp1   = sell_entry - sell_risk * i_tp1_rr
+sell_tp2   = sell_entry - sell_risk * i_tp2_rr
+
+f_draw_risk(_e, _s, _t1, _t2) =>
+    line.new(bar_index, _e,  bar_index + 12, _e,  color = color.new(color.gray, 0), width = 1)
+    line.new(bar_index, _s,  bar_index + 12, _s,  color = color.new(color.red, 0), width = 1)
+    line.new(bar_index, _t1, bar_index + 12, _t1, color = color.new(color.green, 30), style = line.style_dashed)
+    line.new(bar_index, _t2, bar_index + 12, _t2, color = color.new(color.green, 0), style = line.style_dashed)
+
+if i_draw_risk and buy_trig and buy_risk > 0
+    f_draw_risk(buy_entry, buy_stop, buy_tp1, buy_tp2)
+if i_draw_risk and sell_trig and sell_risk > 0
+    f_draw_risk(sell_entry, sell_stop, sell_tp1, sell_tp2)
+
+// ============================================================================
+// VISUALS — background + signal labels
+// ============================================================================
+bgcolor(buy_ok  ? color.new(color.green, 88) : na, title = "Buy zone")
+bgcolor(sell_ok ? color.new(color.red,   88) : na, title = "Sell zone")
+
+if i_show_lbl and buy_trig
+    label.new(bar_index, low, "BUY " + f_grade(buy_score) + "  " + str.tostring(buy_score) + "/13", style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, yloc = yloc.belowbar, size = size.small)
+if i_show_lbl and sell_trig
+    label.new(bar_index, high, "SELL " + f_grade(sell_score) + "  " + str.tostring(sell_score) + "/13", style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, yloc = yloc.abovebar, size = size.small)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+var table tp = table.new(position.top_right, 3, 14, border_width = 1, border_color = color.new(color.gray, 60), frame_width = 1, frame_color = color.new(color.gray, 40))
+
+f_cell(_c, _r, _txt, _bg) =>
+    table.cell(tp, _c, _r, _txt, text_color = color.white, bgcolor = _bg, text_size = size.small)
+
+f_yn(_b) => _b ? color.new(color.green, 35) : color.new(color.red, 50)
+
+if i_show_panel and barstate.islast
+    nv = color.new(color.navy, 0)
+    gy = color.new(color.gray, 70)
+    f_cell(0, 0, "FACTOR (weight)", nv)
+    f_cell(1, 0, "BUY", color.new(color.green, 20))
+    f_cell(2, 0, "SELL", color.new(color.red, 20))
+
+    f_cell(0, 1, "Bias  BOS/CHoCH (2)", gy)
+    f_cell(1, 1, bull_bias ? "UP" : "-", f_yn(bull_bias))
+    f_cell(2, 1, bear_bias ? "DN" : "-", f_yn(bear_bias))
+
+    f_cell(0, 2, "HTF Trend (1)", gy)
+    f_cell(1, 2, htf_bull ? "YES" : "no", f_yn(htf_bull))
+    f_cell(2, 2, htf_bear ? "YES" : "no", f_yn(htf_bear))
+
+    f_cell(0, 3, "Premium/Discount (1)", gy)
+    f_cell(1, 3, discount ? "DISC" : "-", f_yn(discount))
+    f_cell(2, 3, premium ? "PREM" : "-", f_yn(premium))
+
+    f_cell(0, 4, "FVG retest (2)", gy)
+    f_cell(1, 4, in_bull_fvg ? "YES" : "no", f_yn(in_bull_fvg))
+    f_cell(2, 4, in_bear_fvg ? "YES" : "no", f_yn(in_bear_fvg))
+
+    f_cell(0, 5, "Order Block (2)", gy)
+    f_cell(1, 5, in_bull_ob ? "YES" : "no", f_yn(in_bull_ob))
+    f_cell(2, 5, in_bear_ob ? "YES" : "no", f_yn(in_bear_ob))
+
+    f_cell(0, 6, "Liquidity sweep (2)", gy)
+    f_cell(1, 6, recent_buy_sweep ? "YES" : "no", f_yn(recent_buy_sweep))
+    f_cell(2, 6, recent_sell_sweep ? "YES" : "no", f_yn(recent_sell_sweep))
+
+    f_cell(0, 7, "VWAP side (1)", gy)
+    f_cell(1, 7, b_vwap > 0 ? "YES" : "no", f_yn(b_vwap > 0))
+    f_cell(2, 7, s_vwap > 0 ? "YES" : "no", f_yn(s_vwap > 0))
+
+    f_cell(0, 8, "Volume Profile (1)", gy)
+    f_cell(1, 8, vp_buy_support ? "VAL" : "-", f_yn(vp_buy_support))
+    f_cell(2, 8, vp_sel_resist ? "VAH" : "-", f_yn(vp_sel_resist))
+
+    f_cell(0, 9, "Vol confirm  RVOL " + str.tostring(rvol, "#.0") + " (1)", gy)
+    f_cell(1, 9, b_conf > 0 ? "YES" : "no", f_yn(b_conf > 0))
+    f_cell(2, 9, s_conf > 0 ? "YES" : "no", f_yn(s_conf > 0))
+
+    f_cell(0, 10, "SCORE / 13", nv)
+    f_cell(1, 10, str.tostring(buy_score), buy_score >= i_buy_thr ? color.new(color.green, 10) : gy)
+    f_cell(2, 10, str.tostring(sell_score), sell_score >= i_buy_thr ? color.new(color.red, 10) : gy)
+
+    f_cell(0, 11, "GRADE", nv)
+    f_cell(1, 11, buy_gate ? f_grade(buy_score) : "-", buy_gate ? color.new(color.green, 10) : gy)
+    f_cell(2, 11, sell_gate ? f_grade(sell_score) : "-", sell_gate ? color.new(color.red, 10) : gy)
+
+    f_cell(0, 12, "SIGNAL", nv)
+    f_cell(1, 12, buy_ok ? "BUY" : "-", buy_ok ? color.new(color.green, 0) : color.new(color.gray, 30))
+    f_cell(2, 12, sell_ok ? "SELL" : "-", sell_ok ? color.new(color.red, 0) : color.new(color.gray, 30))
+
+    buy_plan  = buy_ok and buy_risk > 0 ? "SL " + str.tostring(buy_stop, format.mintick) + " TP " + str.tostring(buy_tp2, format.mintick) : "-"
+    sell_plan = sell_ok and sell_risk > 0 ? "SL " + str.tostring(sell_stop, format.mintick) + " TP " + str.tostring(sell_tp2, format.mintick) : "-"
+    f_cell(0, 13, "PLAN (TP2)", nv)
+    f_cell(1, 13, buy_plan, color.new(color.black, 20))
+    f_cell(2, 13, sell_plan, color.new(color.black, 20))
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(buy_trig,  title = "ISS · BUY",  message = "ISS BUY {{ticker}} {{interval}} @ {{close}} | Bias + Discount + Imbalance + Liquidity aligned")
+alertcondition(sell_trig, title = "ISS · SELL", message = "ISS SELL {{ticker}} {{interval}} @ {{close}} | Bias + Premium + Imbalance + Liquidity aligned")
