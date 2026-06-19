@@ -1,0 +1,784 @@
+//@version=5
+strategy("Institutional Swing Trader Pro v2.0",
+     overlay        = true,
+     max_labels_count = 500,
+     max_lines_count  = 500,
+     max_boxes_count  = 500,
+     max_bars_back    = 5000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 2,
+     pyramiding        = 0,
+     calc_on_every_tick = false,
+     slippage          = 2,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.05)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║  CHANGE LOG (this revision)                                    ║
+// ║  • Removed Premium/Discount + OTE "zone" module (old §9):      ║
+// ║    inputs, scoring factors, plots, backgrounds, panel rows.    ║
+// ║  • Removed EMA trend filter and RSI filter (inputs, scoring,   ║
+// ║    plots, panel rows).                                         ║
+// ║  • FIX: Volume Profile loop used break/continue, which Pine    ║
+// ║    v5 does not support — rewritten with if-guards + a while    ║
+// ║    loop. ta.highest/ta.lowest hoisted out of the conditional   ║
+// ║    so their series state stays correct.                        ║
+// ║  • FIX: trailing stop trail_offset is in TICKS, not price —    ║
+// ║    converted with syminfo.mintick. TP2 runner now also carries ║
+// ║    a hard protective stop.                                     ║
+// ║  • Confluence score is now out of 13 (labels/threshold fixed). ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                   §1  INPUTS                                ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// --- Market Structure ---
+grp_ms    = "Market Structure"
+i_swing   = input.int(5,    "Swing Pivot Length",         group=grp_ms, minval=2)
+i_structure_confirm = input.bool(true, "Require Structure Confirm", group=grp_ms)
+
+// --- Volume Profile ---
+grp_vp    = "Volume Profile"
+i_vp_len  = input.int(100,  "VP Lookback Bars",           group=grp_vp, minval=20)
+i_vp_bins = input.int(20,   "VP Bins",                   group=grp_vp, minval=8, maxval=48)
+i_vp_pct  = input.float(70.0, "Value Area %",            group=grp_vp, minval=50, maxval=95, step=5)
+i_show_vp = input.bool(true, "Show VP Levels",           group=grp_vp)
+
+// --- FVG ---
+grp_fvg   = "Fair Value Gap"
+i_fvg_exp = input.int(100,  "FVG Expiry (bars)",         group=grp_fvg, minval=10)
+i_fvg_max = input.int(3,     "Max Active FVGs",           group=grp_fvg, minval=1, maxval=5)
+
+// --- Order Block ---
+grp_ob    = "Order Block"
+i_ob_exp  = input.int(100,  "OB Expiry (bars)",           group=grp_ob, minval=10)
+i_ob_max  = input.int(3,     "Max Active OBs",           group=grp_ob, minval=1, maxval=5)
+
+// --- Volume & Imbalance ---
+grp_vi    = "Volume & Imbalance"
+i_vol_len = input.int(20,   "Volume MA Length",           group=grp_vi, minval=5)
+i_imb_len = input.int(20,   "Imbalance Lookback",       group=grp_vi, minval=5)
+i_imb_thr = input.float(1.5, "Imbalance Threshold",      group=grp_vi, minval=1.0, step=0.1)
+
+// --- Liquidity ---
+grp_lq    = "Liquidity"
+i_liq_len = input.int(20,   "Liquidity Lookback",         group=grp_lq, minval=5)
+i_eq_atr  = input.float(0.5, "Equal H/L ATR Multiplier", group=grp_lq, minval=0.1, step=0.1)
+
+// --- Signal ---
+grp_sig   = "Signal Settings"
+i_min_score = input.int(8,  "Min Confluence Score",      group=grp_sig, minval=4, maxval=13)
+i_confirm   = input.bool(true, "Require Candle Confirm", group=grp_sig)
+
+// --- Risk Management ---
+grp_risk  = "Risk Management"
+i_sl_atr   = input.float(2.0, "Stop Loss ATR Multiplier", group=grp_risk, minval=0.5, step=0.5)
+i_tp1_rr   = input.float(1.5, "TP1 Risk:Reward",           group=grp_risk, minval=0.5, step=0.5)
+i_tp2_rr   = input.float(3.0, "TP2 Risk:Reward",           group=grp_risk, minval=1.0, step=0.5)
+i_trail_atr = input.float(1.5, "Trailing Stop ATR",         group=grp_risk, minval=0.5, step=0.5)
+
+// --- Display ---
+grp_disp  = "Display"
+i_show_fvg  = input.bool(true, "Show FVG Boxes",          group=grp_disp)
+i_show_ob   = input.bool(true, "Show Order Block Boxes",  group=grp_disp)
+i_show_liq  = input.bool(true, "Show Liquidity Lines",    group=grp_disp)
+i_show_vwap = input.bool(true, "Show VWAP + Bands",      group=grp_disp)
+i_show_bos  = input.bool(true, "Show BOS/CHoCH Labels",   group=grp_disp)
+i_show_sig  = input.bool(true, "Show Signal Labels",      group=grp_disp)
+i_show_panel = input.bool(true, "Show Status Panel",      group=grp_disp)
+i_use_strategy = input.bool(true, "Enable Strategy Trades", group=grp_disp)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║              §2  CORE CALCULATIONS                          ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+atr_val  = ta.atr(14)
+vwap_val = ta.vwap(hlc3)                     // ta.vwap() is the correct v5 built-in
+avg_vol  = ta.sma(volume, i_vol_len)
+hi_vol   = volume > avg_vol * 1.3
+
+// VWAP Standard Deviation Bands (2σ)
+vwapsd   = 0.0
+vp_std_sum = 0.0
+vp_std_cnt = 0
+for _i = 0 to i_vol_len - 1
+    _diff  = hlc3[_i] - vwap_val
+    vp_std_sum += _diff * _diff
+    vp_std_cnt += 1
+vwapsd := vp_std_cnt > 0 ? math.sqrt(vp_std_sum / vp_std_cnt) : atr_val
+vwap_upper = vwap_val + vwapsd * 2
+vwap_lower = vwap_val - vwapsd * 2
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║          §3  MARKET STRUCTURE  (BOS / CHoCH)                ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+swing_hi_val = ta.pivothigh(high, i_swing, i_swing)
+swing_lo_val = ta.pivotlow(low, i_swing, i_swing)
+
+// Store last TWO confirmed swing points
+var float sh1 = na   // most recent swing high
+var float sh2 = na   // previous swing high
+var float sl1 = na   // most recent swing low
+var float sl2 = na   // previous swing low
+var int   sh1_bar = na
+var int   sl1_bar = na
+
+if not na(swing_hi_val)
+    sh2 := sh1
+    sh1 := swing_hi_val
+    sh1_bar := bar_index - i_swing
+
+if not na(swing_lo_val)
+    sl2 := sl1
+    sl1 := swing_lo_val
+    sl1_bar := bar_index - i_swing
+
+// Trend State: 1 = bullish, -1 = bearish, 0 = neutral
+var int trend_state = 0
+
+// Break of Structure (BOS) — in direction of trend (continuation)
+bull_bos = trend_state == 1 and not na(sh2) and close > sh2 and close[1] <= sh2
+bear_bos = trend_state == -1 and not na(sl2) and close < sl2 and close[1] >= sl2
+
+// Change of Character (CHoCH) — against trend (reversal)
+bull_choch = trend_state == -1 and not na(sh2) and close > sh2 and close[1] <= sh2
+bear_choch = trend_state == 1 and not na(sl2) and close < sl2 and close[1] >= sl2
+
+// Update trend state
+if bull_bos or bull_choch
+    trend_state := 1
+
+if bear_bos or bear_choch
+    trend_state := -1
+
+// Structure alignment for signals
+bull_structure = trend_state == 1
+bear_structure = trend_state == -1
+structure_choc  = bull_choch or bear_choch
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║            §4  VOLUME PROFILE  (Bin-Based)                   ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Declare persistent variables outside the conditional block
+var float vp_poc = na
+var float vp_vah = na
+var float vp_val = na
+var float[] _bins = array.new_float(i_vp_bins, 0.0)
+
+// FIXED: ta.* must be evaluated on EVERY bar to keep their internal
+// series state correct, so compute the range extremes globally and reuse
+// them inside the periodic recompute block below.
+vp_hi_all = ta.highest(high, i_vp_len)
+vp_lo_all = ta.lowest(low,  i_vp_len)
+
+// Recalculate VP every 5 bars for performance
+if bar_index % 5 == 0 or barstate.isfirst
+    // Reset the bins
+    for _k = 0 to i_vp_bins - 1
+        array.set(_bins, _k, 0.0)
+
+    _rng = vp_hi_all - vp_lo_all
+
+    if not na(_rng) and _rng > 0
+        _bsz = _rng / i_vp_bins
+
+        // Distribute each bar's volume across overlapping bins.
+        // FIXED: replaced the unsupported `continue` with an if-guard.
+        for _bi = 0 to i_vp_len - 1
+            if _bi <= bar_index             // only use bars that exist
+                _bh = high[_bi]
+                _bl = low[_bi]
+                _bv = volume[_bi]
+                if _bh > _bl and _bsz > 0
+                    _sb = int(math.max(0, math.floor((_bl - vp_lo_all) / _bsz)))
+                    _eb = int(math.min(i_vp_bins - 1, math.floor((_bh - vp_lo_all) / _bsz)))
+                    if _sb <= _eb
+                        _nb = _eb - _sb + 1
+                        _ev = _bv / _nb
+                        for _j = _sb to _eb
+                            array.set(_bins, _j, array.get(_bins, _j) + _ev)
+
+        // POC — bin with highest volume
+        _maxV = 0.0
+        _maxI = 0
+        for _k = 0 to i_vp_bins - 1
+            _v = array.get(_bins, _k)
+            if _v > _maxV
+                _maxV := _v
+                _maxI := _k
+
+        vp_poc := vp_lo_all + (_maxI + 0.5) * _bsz
+
+        // Value Area (expanding from POC until target % reached)
+        _totalV = 0.0
+        for _k = 0 to i_vp_bins - 1
+            _totalV += array.get(_bins, _k)
+
+        if _totalV > 0
+            _targetV = _totalV * (i_vp_pct / 100.0)
+            _cumV  = _maxV
+            _upBin = _maxI
+            _loBin = _maxI
+
+            // FIXED: replaced the for-loop + break with a while loop.
+            while _cumV < _targetV and (_upBin < i_vp_bins - 1 or _loBin > 0)
+                _uv = (_upBin < i_vp_bins - 1) ? array.get(_bins, _upBin + 1) : -1.0
+                _lv = (_loBin > 0) ? array.get(_bins, _loBin - 1) : -1.0
+
+                if _uv >= _lv and _upBin < i_vp_bins - 1
+                    _upBin += 1
+                    _cumV += math.max(_uv, 0)
+                else if _loBin > 0
+                    _loBin -= 1
+                    _cumV += math.max(_lv, 0)
+                else
+                    _upBin += 1
+                    _cumV += math.max(_uv, 0)
+
+            vp_vah := vp_lo_all + (_upBin + 1) * _bsz
+            vp_val := vp_lo_all + _loBin * _bsz
+
+// VP proximity checks
+at_vp_poc = not na(vp_poc) and math.abs(close - vp_poc) < atr_val * 0.5
+at_vp_val = not na(vp_val) and close <= vp_val and close >= vp_val - atr_val * 0.3
+at_vp_vah = not na(vp_vah) and close >= vp_vah and close <= vp_vah + atr_val * 0.3
+at_vp_level = at_vp_poc or at_vp_val or at_vp_vah
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║           §5  VOLUME ANALYSIS  (Imbalance / Delta)            ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Candle Position — where did price close within the bar?
+candle_mid = (high + low) / 2.0
+candle_rng = high - low
+candle_pos = candle_rng > 0 ? (close - candle_mid) / (candle_rng * 0.5) : 0.0  // -1 to +1
+
+// Approximate Volume Delta per bar
+bar_delta = candle_pos * volume  // positive = net buying, negative = net selling
+
+// Running Imbalance Ratio over lookback
+pos_delta  = math.sum(math.max(bar_delta, 0), i_imb_len)
+neg_delta  = math.sum(math.abs(math.min(bar_delta, 0)), i_imb_len)
+imb_ratio  = neg_delta > 0 ? pos_delta / neg_delta : 1.0
+
+bullish_imbalance = imb_ratio > i_imb_thr
+bearish_imbalance = imb_ratio < (1.0 / i_imb_thr)
+
+// Institutional Candle — large body, high volume, directional close
+body_size  = math.abs(close - open)
+body_ratio = candle_rng > 0 ? body_size / candle_rng : 0
+inst_candle = body_ratio > 0.6 and hi_vol  // 60%+ body, above-avg volume
+bull_inst = inst_candle and close > open
+bear_inst = inst_candle and close < open
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║       §6  FAIR VALUE GAP  (Multi-Zone Tracker)               ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Bullish FVG: bar[2].high < bar[0].low (gap going UP)
+bull_fvg_new = high[2] < low
+// Bearish FVG: bar[2].low > bar[0].high (gap going DOWN)
+bear_fvg_new = low[2] > high
+
+// Arrays for multi-zone tracking
+var float[] bfvg_top = array.new_float(i_fvg_max)
+var float[] bfvg_bot = array.new_float(i_fvg_max)
+var int[]   bfvg_age = array.new_int(i_fvg_max, 9999)
+
+var float[] sfvg_top = array.new_float(i_fvg_max)
+var float[] sfvg_bot = array.new_float(i_fvg_max)
+var int[]   sfvg_age = array.new_int(i_fvg_max, 9999)
+
+// Shift ages and find oldest slot
+if bull_fvg_new
+    // Age all existing
+    for _fi = 0 to i_fvg_max - 1
+        array.set(bfvg_age, _fi, array.get(bfvg_age, _fi) + 1)
+    // Find expired or oldest slot
+    int _slot = 0
+    int _max_age = -1
+    for _fi = 0 to i_fvg_max - 1
+        _a = array.get(bfvg_age, _fi)
+        if _a >= i_fvg_exp or _a > _max_age
+            _slot  := _fi
+            _max_age := _a
+    array.set(bfvg_top, _slot, low)
+    array.set(bfvg_bot, _slot, high[2])
+    array.set(bfvg_age, _slot, 0)
+else
+    for _fi = 0 to i_fvg_max - 1
+        array.set(bfvg_age, _fi, array.get(bfvg_age, _fi) + 1)
+
+if bear_fvg_new
+    for _fi = 0 to i_fvg_max - 1
+        array.set(sfvg_age, _fi, array.get(sfvg_age, _fi) + 1)
+    int _slot2 = 0
+    int _max_age2 = -1
+    for _fi = 0 to i_fvg_max - 1
+        _a2 = array.get(sfvg_age, _fi)
+        if _a2 >= i_fvg_exp or _a2 > _max_age2
+            _slot2  := _fi
+            _max_age2 := _a2
+    array.set(sfvg_top, _slot2, low[2])
+    array.set(sfvg_bot, _slot2, high)
+    array.set(sfvg_age, _slot2, 0)
+else
+    for _fi = 0 to i_fvg_max - 1
+        array.set(sfvg_age, _fi, array.get(sfvg_age, _fi) + 1)
+
+// Check if price is inside any live Bull FVG
+bull_fvg_live = false
+bull_fvg_retest = false
+for _fi = 0 to i_fvg_max - 1
+    _top = array.get(bfvg_top, _fi)
+    _bot = array.get(bfvg_bot, _fi)
+    _age = array.get(bfvg_age, _fi)
+    if _age < i_fvg_exp and not na(_top)
+        bull_fvg_live := true
+        if low <= _top and high >= _bot
+            bull_fvg_retest := true
+
+// Check if price is inside any live Bear FVG
+bear_fvg_live = false
+bear_fvg_retest = false
+for _fi = 0 to i_fvg_max - 1
+    _top = array.get(sfvg_top, _fi)
+    _bot = array.get(sfvg_bot, _fi)
+    _age = array.get(sfvg_age, _fi)
+    if _age < i_fvg_exp and not na(_top)
+        bear_fvg_live := true
+        if high >= _bot and low <= _top
+            bear_fvg_retest := true
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║       §7  ORDER BLOCKS  (Multi-Zone Tracker)                ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Bull OB: last bearish candle before a bullish FVG (institutional sell → reversal up)
+// Bear OB: last bullish candle before a bearish FVG (institutional buy → reversal down)
+
+var float[] bbob_top = array.new_float(i_ob_max)
+var float[] bbob_bot = array.new_float(i_ob_max)
+var int[]   bbob_age = array.new_int(i_ob_max, 9999)
+
+var float[] sbob_top = array.new_float(i_ob_max)
+var float[] sbob_bot = array.new_float(i_ob_max)
+var int[]   sbob_age = array.new_int(i_ob_max, 9999)
+
+if bull_fvg_new
+    for _oi = 0 to i_ob_max - 1
+        array.set(bbob_age, _oi, array.get(bbob_age, _oi) + 1)
+    int _slot3 = 0
+    int _max_age3 = -1
+    for _oi = 0 to i_ob_max - 1
+        _a3 = array.get(bbob_age, _oi)
+        if _a3 >= i_ob_exp or _a3 > _max_age3
+            _slot3  := _oi
+            _max_age3 := _a3
+    array.set(bbob_top, _slot3, high[2])
+    array.set(bbob_bot, _slot3, low[2])
+    array.set(bbob_age, _slot3, 0)
+else
+    for _oi = 0 to i_ob_max - 1
+        array.set(bbob_age, _oi, array.get(bbob_age, _oi) + 1)
+
+if bear_fvg_new
+    for _oi = 0 to i_ob_max - 1
+        array.set(sbob_age, _oi, array.get(sbob_age, _oi) + 1)
+    int _slot4 = 0
+    int _max_age4 = -1
+    for _oi = 0 to i_ob_max - 1
+        _a4 = array.get(sbob_age, _oi)
+        if _a4 >= i_ob_exp or _a4 > _max_age4
+            _slot4  := _oi
+            _max_age4 := _a4
+    array.set(sbob_top, _slot4, high[2])
+    array.set(sbob_bot, _slot4, low[2])
+    array.set(sbob_age, _slot4, 0)
+else
+    for _oi = 0 to i_ob_max - 1
+        array.set(sbob_age, _oi, array.get(sbob_age, _oi) + 1)
+
+// Price at Bull OB (buy zone)
+at_bull_ob = false
+for _oi = 0 to i_ob_max - 1
+    _top = array.get(bbob_top, _oi)
+    _bot = array.get(bbob_bot, _oi)
+    _age = array.get(bbob_age, _oi)
+    if _age < i_ob_exp and not na(_top) and low <= _top and high >= _bot
+        at_bull_ob := true
+
+// Price at Bear OB (sell zone)
+at_bear_ob = false
+for _oi = 0 to i_ob_max - 1
+    _top = array.get(sbob_top, _oi)
+    _bot = array.get(sbob_bot, _oi)
+    _age = array.get(sbob_age, _oi)
+    if _age < i_ob_exp and not na(_top) and high >= _bot and low <= _top
+        at_bear_ob := true
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║          §8  LIQUIDITY  (Equal H/L + Sweeps)               ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// Equal Highs / Equal Lows — institutional liquidity pools
+eq_tol = atr_val * i_eq_atr
+equal_highs = not na(sh1) and not na(sh2) and math.abs(sh1 - sh2) < eq_tol
+equal_lows  = not na(sl1) and not na(sl2) and math.abs(sl1 - sl2) < eq_tol
+
+// Liquidity Pool Levels
+liq_pool_hi = equal_highs ? math.max(nz(sh1, high), nz(sh2, high)) : na
+liq_pool_lo = equal_lows  ? math.min(nz(sl1, low), nz(sl2, low)) : na
+
+// Sweep Detection — price takes out liquidity then reverses
+liq_hi_level = ta.highest(high[1], i_liq_len)
+liq_lo_level = ta.lowest(low[1], i_liq_len)
+
+sell_sweep = high > liq_hi_level and close < liq_hi_level  // swept high, closed below
+buy_sweep  = low < liq_lo_level and close > liq_lo_level   // swept low, closed above
+
+// Extended sweep window (within last 5 bars)
+recent_sell_sweep = sell_sweep[4] or sell_sweep[3] or sell_sweep[2] or sell_sweep[1] or sell_sweep
+recent_buy_sweep  = buy_sweep[4] or buy_sweep[3] or buy_sweep[2] or buy_sweep[1] or buy_sweep
+
+// Stop Hunt — extra liquidity grab (wicks beyond level then strong close back)
+stop_hunt_sell = high > liq_hi_level and close < open and (liq_hi_level - close) > atr_val * 0.3
+stop_hunt_buy  = low < liq_lo_level and close > open and (close - liq_lo_level) > atr_val * 0.3
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║          §9  SIGNAL SCORING  (Weighted Confluence)            ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// --- BUY SCORING (8 factors, max 13 points) ---
+int b_score = 0
+string b_reasons = ""
+
+// (1) Market Structure: BOS bullish (+2) or CHoCH bullish (+3)
+if bull_structure
+    b_score += 2
+    b_reasons += "BOS+2 "
+else if bull_choch
+    b_score += 3
+    b_reasons += "CHoCH+3 "
+
+// (2) Price at Bullish FVG (+2)
+if bull_fvg_live and bull_fvg_retest
+    b_score += 2
+    b_reasons += "FVG+2 "
+
+// (3) Price at Bullish Order Block (+2)
+if at_bull_ob
+    b_score += 2
+    b_reasons += "OB+2 "
+
+// (4) Volume Profile: at VAL/POC (+2)
+if at_vp_val
+    b_score += 2
+    b_reasons += "VPVAL+2 "
+else if at_vp_poc
+    b_score += 1
+    b_reasons += "VPPOC+1 "
+
+// (5) VWAP: price above VWAP (+1)
+if close > vwap_val
+    b_score += 1
+    b_reasons += "VWAP+1 "
+
+// (6) Volume Imbalance: bullish (+1)
+if bullish_imbalance
+    b_score += 1
+    b_reasons += "VOL+1 "
+
+// (7) Institutional Candle: bullish (+1)
+if bull_inst
+    b_score += 1
+    b_reasons += "INST+1 "
+
+// (8) Liquidity Sweep: buy side (+1)
+if recent_buy_sweep
+    b_score += 1
+    b_reasons += "LIQ+1 "
+
+
+// --- SELL SCORING (8 factors, max 13 points) ---
+int s_score = 0
+string s_reasons = ""
+
+if bear_structure
+    s_score += 2
+    s_reasons += "BOS+2 "
+else if bear_choch
+    s_score += 3
+    s_reasons += "CHoCH+3 "
+
+if bear_fvg_live and bear_fvg_retest
+    s_score += 2
+    s_reasons += "FVG+2 "
+
+if at_bear_ob
+    s_score += 2
+    s_reasons += "OB+2 "
+
+if at_vp_vah
+    s_score += 2
+    s_reasons += "VPVAH+2 "
+else if at_vp_poc
+    s_score += 1
+    s_reasons += "VPPOC+1 "
+
+if close < vwap_val
+    s_score += 1
+    s_reasons += "VWAP+1 "
+
+if bearish_imbalance
+    s_score += 1
+    s_reasons += "VOL+1 "
+
+if bear_inst
+    s_score += 1
+    s_reasons += "INST+1 "
+
+if recent_sell_sweep
+    s_score += 1
+    s_reasons += "LIQ+1 "
+
+
+// --- SIGNAL GENERATION ---
+bull_candle = close > open
+bear_candle = close < open
+
+buy_signal  = b_score >= i_min_score and (i_confirm ? bull_candle : true)
+sell_signal = s_score >= i_min_score and (i_confirm ? bear_candle : true)
+
+// Signal Strength Classification (max score = 13)
+buy_strong  = b_score >= 11
+buy_medium  = b_score >= 8 and b_score < 11
+buy_weak    = b_score >= i_min_score and b_score < 8
+
+sell_strong  = s_score >= 11
+sell_medium  = s_score >= 8 and s_score < 11
+sell_weak    = s_score >= i_min_score and s_score < 8
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║       §10  STRATEGY  (Entry / SL / TP / Trail)               ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+if i_use_strategy and barstate.isconfirmed
+    // ---- BUY ENTRY ----
+    if buy_signal and strategy.position_size == 0
+        sl_dist    = atr_val * i_sl_atr
+        tp1_dist   = sl_dist * i_tp1_rr
+        tp2_dist   = sl_dist * i_tp2_rr
+
+        strategy.entry("Long", strategy.long)
+        // TP1: take 50% off at the first target, hard stop below entry.
+        strategy.exit("TP1", "Long", qty_percent=50, limit=close + tp1_dist, stop=close - sl_dist)
+        // TP2: runner — hard stop (protection) + fixed target + trailing.
+        // FIXED: trail_offset must be in TICKS, so divide the ATR distance by mintick.
+        strategy.exit("TP2", "Long", limit=close + tp2_dist, stop=close - sl_dist,
+                      trail_price=close + sl_dist * 0.5, trail_offset=(atr_val * i_trail_atr) / syminfo.mintick)
+
+    // ---- SELL ENTRY ----
+    if sell_signal and strategy.position_size == 0
+        sl_dist    = atr_val * i_sl_atr
+        tp1_dist   = sl_dist * i_tp1_rr
+        tp2_dist   = sl_dist * i_tp2_rr
+
+        strategy.entry("Short", strategy.short)
+        strategy.exit("TP1", "Short", qty_percent=50, limit=close - tp1_dist, stop=close + sl_dist)
+        strategy.exit("TP2", "Short", limit=close - tp2_dist, stop=close + sl_dist,
+                      trail_price=close - sl_dist * 0.5, trail_offset=(atr_val * i_trail_atr) / syminfo.mintick)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║             §11  VISUAL ELEMENTS                               ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+// --- VWAP + Bands ---
+plot(i_show_vwap ? vwap_val   : na, "VWAP",    color=color.purple, linewidth=2)
+plot(i_show_vwap ? vwap_upper : na, "VWAP +2σ", color=color.new(color.purple, 60), linewidth=1, style=plot.style_circles)
+plot(i_show_vwap ? vwap_lower : na, "VWAP -2σ", color=color.new(color.purple, 60), linewidth=1, style=plot.style_circles)
+
+// --- Volume Profile Levels ---
+plot(i_show_vp and not na(vp_poc) ? vp_poc : na, "VP POC", color=color.new(color.yellow, 10), style=plot.style_stepline, linewidth=2)
+plot(i_show_vp and not na(vp_vah) ? vp_vah : na, "VP VAH", color=color.new(color.yellow, 50), style=plot.style_stepline, linewidth=1)
+plot(i_show_vp and not na(vp_val) ? vp_val : na, "VP VAL", color=color.new(color.yellow, 50), style=plot.style_stepline, linewidth=1)
+
+// --- Signal Backgrounds ---
+bgcolor(buy_strong  and i_show_sig ? color.new(color.green, 75) : na, title="Strong Buy BG")
+bgcolor(sell_strong and i_show_sig ? color.new(color.red, 75)   : na, title="Strong Sell BG")
+bgcolor(buy_medium  and i_show_sig ? color.new(color.green, 85) : na, title="Medium Buy BG")
+bgcolor(sell_medium and i_show_sig ? color.new(color.red, 85)   : na, title="Medium Sell BG")
+
+// --- FVG Boxes (new detections only) ---
+fvg_extend = input.int(30, "FVG Box Extend Bars", group=grp_disp)
+if i_show_fvg and bear_fvg_new
+    box.new(bar_index - 2, low[2], bar_index + fvg_extend, high,
+         border_color=color.new(color.red, 30), border_width=1,
+         bgcolor=color.new(color.red, 88),
+         text="Bear FVG", text_color=color.new(color.red, 20),
+         text_size=size.tiny, text_halign=text.align_right)
+
+if i_show_fvg and bull_fvg_new
+    box.new(bar_index - 2, high[2], bar_index + fvg_extend, low,
+         border_color=color.new(color.green, 30), border_width=1,
+         bgcolor=color.new(color.green, 88),
+         text="Bull FVG", text_color=color.new(color.green, 20),
+         text_size=size.tiny, text_halign=text.align_right)
+
+// --- Order Block Boxes ---
+ob_extend = input.int(40, "OB Box Extend Bars", group=grp_disp)
+if i_show_ob and bull_fvg_new
+    box.new(bar_index - 4, high[2], bar_index + ob_extend, low[2],
+         border_color=color.new(color.blue, 20), border_width=1,
+         bgcolor=color.new(color.blue, 88),
+         text="Bull OB", text_color=color.new(color.blue, 10),
+         text_size=size.tiny, text_halign=text.align_right)
+
+if i_show_ob and bear_fvg_new
+    box.new(bar_index - 4, high[2], bar_index + ob_extend, low[2],
+         border_color=color.new(color.orange, 20), border_width=1,
+         bgcolor=color.new(color.orange, 88),
+         text="Bear OB", text_color=color.new(color.orange, 10),
+         text_size=size.tiny, text_halign=text.align_right)
+
+// --- Liquidity Lines ---
+if i_show_liq and sell_sweep
+    line.new(bar_index - i_liq_len, liq_hi_level, bar_index, liq_hi_level,
+          color=color.new(color.red, 20), style=line.style_dashed, width=1)
+
+if i_show_liq and buy_sweep
+    line.new(bar_index - i_liq_len, liq_lo_level, bar_index, liq_lo_level,
+          color=color.new(color.green, 20), style=line.style_dashed, width=1)
+
+// --- BOS / CHoCH Labels ---
+if i_show_bos and bull_choch
+    label.new(bar_index, low, "▲ CHoCH", style=label.style_label_up,
+         color=color.teal, textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+
+if i_show_bos and bear_choch
+    label.new(bar_index, high, "▼ CHoCH", style=label.style_label_down,
+         color=color.maroon, textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+
+if i_show_bos and bull_bos
+    label.new(bar_index, low, "▲ BOS", style=label.style_label_up,
+         color=color.new(color.teal, 40), textcolor=color.white, size=size.tiny, yloc=yloc.belowbar)
+
+if i_show_bos and bear_bos
+    label.new(bar_index, high, "▼ BOS", style=label.style_label_down,
+         color=color.new(color.maroon, 40), textcolor=color.white, size=size.tiny, yloc=yloc.abovebar)
+
+// --- Signal Labels ---
+if i_show_sig and buy_signal
+    string _btxt = "BUY " + str.tostring(b_score) + "/13\n" + b_reasons
+    label.new(bar_index, low, _btxt, style=label.style_label_up,
+         color=buy_strong ? color.green : buy_medium ? color.new(color.teal, 0) : color.new(color.green, 30),
+         textcolor=color.white, yloc=yloc.belowbar, size=size.normal)
+
+if i_show_sig and sell_signal
+    string _stxt = "SELL " + str.tostring(s_score) + "/13\n" + s_reasons
+    label.new(bar_index, high, _stxt, style=label.style_label_down,
+         color=sell_strong ? color.red : sell_medium ? color.new(color.orange, 0) : color.new(color.red, 30),
+         textcolor=color.white, yloc=yloc.abovebar, size=size.normal)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║              §12  STATUS PANEL                               ║
+// ╚═══════════════════════════════════════════════════════════════╝
+
+var table panel = table.new(position.top_right, 3, 11, border_width=1, border_color=color.gray,
+     frame_width=1, frame_color=color.gray)
+
+if i_show_panel and barstate.islast
+    gn  = color.new(color.green, 40)
+    rd  = color.new(color.red,   40)
+    yl  = color.new(color.yellow, 40)
+    nv  = color.navy
+
+    // Header
+    table.cell(panel, 0, 0, "CONDITION",        text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 0, "SELL " + str.tostring(s_score) + "/13", text_color=color.white, bgcolor=rd, text_size=size.small)
+    table.cell(panel, 2, 0, "BUY  " + str.tostring(b_score) + "/13", text_color=color.white, bgcolor=gn, text_size=size.small)
+
+    // Row 1: Structure
+    table.cell(panel, 0, 1, "Structure",                    text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 1, bear_structure ? "BOS" : bear_choch ? "CHoCH" : "—", text_color=color.white, bgcolor=bear_structure ? gn : bear_choch ? yl : rd, text_size=size.small)
+    table.cell(panel, 2, 1, bull_structure ? "BOS" : bull_choch ? "CHoCH" : "—", text_color=color.white, bgcolor=bull_structure ? gn : bull_choch ? yl : rd, text_size=size.small)
+
+    // Row 2: FVG
+    table.cell(panel, 0, 2, "FVG Retest",       text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 2, bear_fvg_retest ? "YES" : "NO", text_color=color.white, bgcolor=bear_fvg_retest ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 2, bull_fvg_retest ? "YES" : "NO", text_color=color.white, bgcolor=bull_fvg_retest ? gn : rd, text_size=size.small)
+
+    // Row 3: Order Block
+    table.cell(panel, 0, 3, "Order Block",      text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 3, at_bear_ob ? "YES" : "NO", text_color=color.white, bgcolor=at_bear_ob ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 3, at_bull_ob ? "YES" : "NO", text_color=color.white, bgcolor=at_bull_ob ? gn : rd, text_size=size.small)
+
+    // Row 4: Volume Profile
+    table.cell(panel, 0, 4, "VP Level",         text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 4, at_vp_vah ? "VAH" : at_vp_poc ? "POC" : "—", text_color=color.white, bgcolor=at_vp_vah ? yl : at_vp_poc ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 4, at_vp_val ? "VAL" : at_vp_poc ? "POC" : "—", text_color=color.white, bgcolor=at_vp_val ? yl : at_vp_poc ? gn : rd, text_size=size.small)
+
+    // Row 5: VWAP
+    table.cell(panel, 0, 5, "VWAP Side",        text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 5, close < vwap_val ? "BELOW" : "ABOVE", text_color=color.white, bgcolor=close < vwap_val ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 5, close > vwap_val ? "ABOVE" : "BELOW", text_color=color.white, bgcolor=close > vwap_val ? gn : rd, text_size=size.small)
+
+    // Row 6: Volume Imbalance
+    table.cell(panel, 0, 6, "Vol Imbalance",    text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 6, bearish_imbalance ? "SELL" : "—", text_color=color.white, bgcolor=bearish_imbalance ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 6, bullish_imbalance ? "BUY" : "—", text_color=color.white, bgcolor=bullish_imbalance ? gn : rd, text_size=size.small)
+
+    // Row 7: Institutional Candle
+    table.cell(panel, 0, 7, "Inst Candle",      text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 7, bear_inst ? "▼" : "—", text_color=color.white, bgcolor=bear_inst ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 7, bull_inst ? "▲" : "—", text_color=color.white, bgcolor=bull_inst ? gn : rd, text_size=size.small)
+
+    // Row 8: Liquidity Sweep
+    table.cell(panel, 0, 8, "Liq Sweep",        text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 8, recent_sell_sweep ? "YES" : "NO", text_color=color.white, bgcolor=recent_sell_sweep ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 8, recent_buy_sweep  ? "YES" : "NO", text_color=color.white, bgcolor=recent_buy_sweep ? gn : rd, text_size=size.small)
+
+    // Row 9: SIGNAL
+    string sell_txt = sell_strong ? "STRONG SELL" : sell_medium ? "MEDIUM SELL" : sell_weak ? "WEAK SELL" : "—"
+    string buy_txt  = buy_strong  ? "STRONG BUY"  : buy_medium  ? "MEDIUM BUY"  : buy_weak  ? "WEAK BUY"  : "—"
+    sell_bg = sell_strong ? color.new(color.red, 10)    : sell_medium ? color.new(color.orange, 10) : sell_weak ? color.new(color.red, 40)    : color.new(color.gray, 50)
+    buy_bg  = buy_strong  ? color.new(color.green, 10)  : buy_medium  ? color.new(color.teal, 10)   : buy_weak  ? color.new(color.green, 40)  : color.new(color.gray, 50)
+
+    table.cell(panel, 0, 9, "SIGNAL",           text_color=color.white, bgcolor=nv,  text_size=size.small)
+    table.cell(panel, 1, 9, sell_txt,           text_color=color.white, bgcolor=sell_bg, text_size=size.small)
+    table.cell(panel, 2, 9, buy_txt,            text_color=color.white, bgcolor=buy_bg,  text_size=size.small)
+
+    // Row 10: Imbalance Ratio
+    table.cell(panel, 0, 10, "Imb Ratio",       text_color=color.white, bgcolor=nv, text_size=size.small)
+    table.cell(panel, 1, 10, str.tostring(imb_ratio, "#.##"), text_color=color.white, bgcolor=imb_ratio < 0.67 ? gn : rd, text_size=size.small)
+    table.cell(panel, 2, 10, str.tostring(imb_ratio, "#.##"), text_color=color.white, bgcolor=imb_ratio > 1.5 ? gn : rd, text_size=size.small)
+
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║                    §13  ALERTS                                ║
+// ╚═══════════════════════════════════════════════════════════════╝
+// NOTE: alertcondition() requires a CONST string for `message` — it cannot be built
+// by concatenating series/runtime variables (like b_reasons or str.tostring(b_score)).
+// Use only literal text + {{placeholders}} here. For dynamic per-bar text (with the
+// live score/reasons), use the built-in alert() function instead, called from inside
+// the strategy entry blocks in §10.
+
+alertcondition(buy_strong,  title="STRONG BUY  — Institutional Confluence",
+     message="STRONG BUY | {{ticker_description}} ({{ticker}}) | {{interval}} | Price: {{close}}")
+
+alertcondition(sell_strong, title="STRONG SELL — Institutional Confluence",
+     message="STRONG SELL | {{ticker_description}} ({{ticker}}) | {{interval}} | Price: {{close}}")
+
+alertcondition(buy_signal,  title="BUY SIGNAL  — Confluence Met",
+     message="BUY | {{ticker_description}} ({{ticker}}) | {{interval}} | Price: {{close}}")
+
+alertcondition(sell_signal, title="SELL SIGNAL — Confluence Met",
+     message="SELL | {{ticker_description}} ({{ticker}}) | {{interval}} | Price: {{close}}")
+
+alertcondition(bull_choch,  title="Bullish CHoCH — Trend Reversal Up",
+     message="BULLISH CHoCH | {{ticker_description}} | {{interval}} | Price: {{close}} | Market structure shift to bullish")
+
+alertcondition(bear_choch,  title="Bearish CHoCH — Trend Reversal Down",
+     message="BEARISH CHoCH | {{ticker_description}} | {{interval}} | Price: {{close}} | Market structure shift to bearish")
