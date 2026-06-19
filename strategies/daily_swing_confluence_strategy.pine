@@ -1,0 +1,403 @@
+//@version=5
+// ============================================================================
+//  DAILY SWING CONFLUENCE STRATEGY (DSC-Strat)  — backtestable
+//  The same 6-factor engine as the Daily Swing Confluence indicator, wired to
+//  real entries/exits so you can validate it on historical DAILY data.
+//
+//  Factors (max score 9):
+//    FVG Retest (2) · Order Block (2) · Volume Profile 1-2 · VWAP Side (1)
+//    · Volume Imbalance (1) · Liquidity Sweep (1)
+//
+//  Adds: risk-based position sizing, a fixed stop, and a 2-stage scale-out.
+//  Signals confirm on bar close. ALWAYS include commission + slippage and
+//  validate across symbols/periods. Past performance ≠ future results.
+// ============================================================================
+strategy("Daily Swing Confluence Strategy", "DSC-Strat", overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04,
+     slippage = 2,
+     calc_on_every_tick = false,
+     max_bars_back = 500,
+     max_labels_count = 300)
+
+// ============================================================================
+// GROUPS
+// ============================================================================
+var string G_FVG  = "2 · FVG Retest"
+var string G_OB   = "3 · Order Blocks"
+var string G_VP   = "4 · Volume Profile"
+var string G_VWAP = "5 · VWAP Side"
+var string G_VIMB = "6 · Volume Imbalance"
+var string G_LIQ  = "8 · Liquidity Sweep"
+var string G_SIG  = "Signals / Risk"
+var string G_FILT = "Optional Filter"
+var string G_TIME = "Backtest Window"
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+i_fvg_atr    = input.float(0.25, "Min FVG Size (x ATR)", group = G_FVG, minval = 0.0, step = 0.05)
+i_fvg_expiry = input.int(80,     "FVG Max Age (bars)", group = G_FVG, minval = 5)
+i_max_zones  = input.int(8,      "Max Live Zones (each type)", group = G_FVG, minval = 1, maxval = 30)
+
+i_ob_search = input.int(7,  "OB Lookback (candles)", group = G_OB, minval = 2, maxval = 20)
+i_ob_expiry = input.int(80, "OB Max Age (bars)", group = G_OB, minval = 5)
+
+i_vp_on       = input.bool(true,  "Use Volume Profile factor", group = G_VP)
+i_vp_lookback = input.int(120,    "VP Lookback (bars)", group = G_VP, minval = 20, maxval = 480)
+i_vp_rows     = input.int(40,     "VP Resolution (rows)", group = G_VP, minval = 10, maxval = 100)
+i_vp_va       = input.float(70.0, "Value Area %", group = G_VP, minval = 50, maxval = 95, step = 5)
+i_vp_tol      = input.float(0.30, "Value-edge Tolerance (x ATR)", group = G_VP, minval = 0.05, step = 0.05)
+i_vp_strong   = input.bool(true,  "Allow VP strong (weight 2)", group = G_VP)
+
+i_vwap_on   = input.bool(true,    "Use VWAP Side factor", group = G_VWAP)
+i_vwap_anc  = input.string("Rolling", "VWAP Anchor", options = ["Rolling", "Week", "Month", "Quarter", "Year"], group = G_VWAP)
+i_vwap_len  = input.int(30,       "Rolling VWAP Length", group = G_VWAP, minval = 2)
+
+i_vimb_on  = input.bool(true,  "Use Volume Imbalance factor", group = G_VIMB)
+i_vimb_len = input.int(3,      "Pressure Window (bars)", group = G_VIMB, minval = 1, maxval = 20)
+i_vimb_thr = input.float(10.0, "Dominance Threshold (%)", group = G_VIMB, minval = 0.0, step = 5.0)
+
+i_liq_len   = input.int(20, "Liquidity Lookback", group = G_LIQ, minval = 5)
+i_sweep_win = input.int(3,  "Sweep Recency Window (bars)", group = G_LIQ, minval = 1, maxval = 15)
+
+i_thr      = input.int(5, "Min Score to Enter (of 9)", group = G_SIG, minval = 3, maxval = 9)
+i_req_zone = input.bool(true, "Require FVG or OB zone (gate)", group = G_SIG)
+i_sl_atr   = input.float(0.5, "Stop Buffer (x ATR)", group = G_SIG, minval = 0.0, step = 0.1)
+i_tp1_rr   = input.float(1.0, "Take-Profit 1 (R multiple)", group = G_SIG, minval = 0.5, step = 0.5)
+i_tp2_rr   = input.float(2.0, "Take-Profit 2 (R multiple)", group = G_SIG, minval = 0.5, step = 0.5)
+i_tp1_pct  = input.int(50,    "Scale-out at TP1 (%)", group = G_SIG, minval = 0, maxval = 100)
+i_risk_pct = input.float(1.0, "Risk per Trade (% equity)", group = G_SIG, minval = 0.1, step = 0.1)
+i_longs    = input.bool(true, "Allow Longs", group = G_SIG)
+i_shorts   = input.bool(true, "Allow Shorts", group = G_SIG)
+
+i_trend_on  = input.bool(false, "Optional EMA Trend Gate", group = G_FILT)
+i_trend_len = input.int(50, "Trend EMA Length", group = G_FILT, minval = 10)
+
+i_from = input.time(timestamp("01 Jan 2018 00:00"), "Start", group = G_TIME)
+i_to   = input.time(timestamp("01 Jan 2099 00:00"), "End", group = G_TIME)
+in_window = time >= i_from and time <= i_to
+
+// ============================================================================
+// CORE SERIES
+// ============================================================================
+atr         = ta.atr(14)
+rng_bar     = high - low
+
+// ============================================================================
+// 2 · FAIR VALUE GAPS (logic-only, retest-aware)
+// ============================================================================
+min_gap  = atr * i_fvg_atr
+bull_fvg = low > high[2] and (low - high[2]) > min_gap
+bear_fvg = high < low[2] and (low[2] - high) > min_gap
+
+var array<float> fvgTop = array.new_float()
+var array<float> fvgBot = array.new_float()
+var array<int>   fvgDir = array.new_int()
+var array<int>   fvgBar = array.new_int()
+
+bool  in_bull_fvg = false
+bool  in_bear_fvg = false
+float bull_fvg_lo = na
+float bear_fvg_hi = na
+
+if array.size(fvgTop) > 0
+    for i = array.size(fvgTop) - 1 to 0
+        t  = array.get(fvgTop, i)
+        b  = array.get(fvgBot, i)
+        d  = array.get(fvgDir, i)
+        bi = array.get(fvgBar, i)
+        mitigated = d == 1 ? close < b : close > t
+        expired   = (bar_index - bi) > i_fvg_expiry
+        if mitigated or expired
+            array.remove(fvgTop, i)
+            array.remove(fvgBot, i)
+            array.remove(fvgDir, i)
+            array.remove(fvgBar, i)
+        else
+            touched = low <= t and high >= b
+            if touched and d == 1
+                in_bull_fvg := true
+                bull_fvg_lo := b
+            if touched and d == -1
+                in_bear_fvg := true
+                bear_fvg_hi := t
+
+f_push_fvg(_t, _b, _d) =>
+    array.push(fvgTop, _t)
+    array.push(fvgBot, _b)
+    array.push(fvgDir, _d)
+    array.push(fvgBar, bar_index)
+    if array.size(fvgTop) > i_max_zones
+        array.remove(fvgTop, 0)
+        array.remove(fvgBot, 0)
+        array.remove(fvgDir, 0)
+        array.remove(fvgBar, 0)
+
+if bull_fvg
+    f_push_fvg(low, high[2], 1)
+if bear_fvg
+    f_push_fvg(low[2], high, -1)
+
+// ============================================================================
+// 3 · ORDER BLOCKS (logic-only, retest-aware)
+// ============================================================================
+f_find_ob(_dir) =>
+    float oh = na
+    float ol = na
+    for j = 2 to i_ob_search
+        opp = _dir == 1 ? close[j] < open[j] : close[j] > open[j]
+        if opp and na(oh)
+            oh := high[j]
+            ol := low[j]
+    [oh, ol]
+
+var array<float> obTop = array.new_float()
+var array<float> obBot = array.new_float()
+var array<int>   obDir = array.new_int()
+var array<int>   obBar = array.new_int()
+
+bool  in_bull_ob = false
+bool  in_bear_ob = false
+float bull_ob_lo = na
+float bear_ob_hi = na
+
+if array.size(obTop) > 0
+    for i = array.size(obTop) - 1 to 0
+        t  = array.get(obTop, i)
+        b  = array.get(obBot, i)
+        d  = array.get(obDir, i)
+        bi = array.get(obBar, i)
+        mitigated = d == 1 ? close < b : close > t
+        expired   = (bar_index - bi) > i_ob_expiry
+        if mitigated or expired
+            array.remove(obTop, i)
+            array.remove(obBot, i)
+            array.remove(obDir, i)
+            array.remove(obBar, i)
+        else
+            touched = low <= t and high >= b
+            if touched and d == 1
+                in_bull_ob := true
+                bull_ob_lo := b
+            if touched and d == -1
+                in_bear_ob := true
+                bear_ob_hi := t
+
+f_push_ob(_t, _b, _d) =>
+    if not na(_t) and not na(_b)
+        array.push(obTop, _t)
+        array.push(obBot, _b)
+        array.push(obDir, _d)
+        array.push(obBar, bar_index)
+        if array.size(obTop) > i_max_zones
+            array.remove(obTop, 0)
+            array.remove(obBot, 0)
+            array.remove(obDir, 0)
+            array.remove(obBar, 0)
+
+if bull_fvg
+    [obh, obl] = f_find_ob(1)
+    f_push_ob(obh, obl, 1)
+if bear_fvg
+    [obh2, obl2] = f_find_ob(-1)
+    f_push_ob(obh2, obl2, -1)
+
+// ============================================================================
+// 4 · VOLUME PROFILE (rolling VAH / VAL / POC, every bar)
+// ============================================================================
+f_vp(_lookback, _rows, _va) =>
+    float hh = ta.highest(high, _lookback)
+    float ll = ta.lowest(low,  _lookback)
+    float rng = hh - ll
+    float poc = na
+    float vah = na
+    float val = na
+    if not na(rng) and rng > 0
+        float step = rng / _rows
+        array<float> bins = array.new_float(_rows, 0.0)
+        for k = 0 to _lookback - 1
+            float tp = (high[k] + low[k] + close[k]) / 3.0
+            float v  = volume[k]
+            if not na(tp) and not na(v)
+                int idx = int(math.floor((tp - ll) / step))
+                idx := int(math.max(0, math.min(_rows - 1, idx)))
+                array.set(bins, idx, array.get(bins, idx) + v)
+        int   poc_idx = 0
+        float max_v   = 0.0
+        float total_v = 0.0
+        for i = 0 to _rows - 1
+            float v = array.get(bins, i)
+            total_v += v
+            if v > max_v
+                max_v   := v
+                poc_idx := i
+        float target = total_v * _va / 100.0
+        float acc = max_v
+        int up = poc_idx
+        int dn = poc_idx
+        while acc < target and (up < _rows - 1 or dn > 0)
+            float up_v = up < _rows - 1 ? array.get(bins, up + 1) : -1.0
+            float dn_v = dn > 0 ? array.get(bins, dn - 1) : -1.0
+            if up_v >= dn_v
+                up += 1
+                acc += math.max(up_v, 0)
+            else
+                dn -= 1
+                acc += math.max(dn_v, 0)
+        poc := ll + (poc_idx + 0.5) * step
+        vah := ll + (up + 1) * step
+        val := ll + dn * step
+    [poc, vah, val]
+
+[vp_poc_r, vp_vah_r, vp_val_r] = f_vp(i_vp_lookback, i_vp_rows, i_vp_va)
+float vp_poc = i_vp_on ? vp_poc_r : na
+float vp_vah = i_vp_on ? vp_vah_r : na
+float vp_val = i_vp_on ? vp_val_r : na
+
+vp_tol = atr * i_vp_tol
+in_va  = not na(vp_val) and not na(vp_vah) and close >= vp_val and close <= vp_vah
+
+float buy_vp_f = 0.0
+if not na(vp_poc) and not na(vp_val)
+    near_val = math.abs(close - vp_val) <= vp_tol or (low <= vp_val and close >= vp_val)
+    if in_va and close <= vp_poc
+        buy_vp_f := near_val and i_vp_strong ? 2.0 : 1.0
+    else if near_val
+        buy_vp_f := 1.0
+int buy_vp = int(buy_vp_f)
+
+float sell_vp_f = 0.0
+if not na(vp_poc) and not na(vp_vah)
+    near_vah = math.abs(close - vp_vah) <= vp_tol or (high >= vp_vah and close <= vp_vah)
+    if in_va and close >= vp_poc
+        sell_vp_f := near_vah and i_vp_strong ? 2.0 : 1.0
+    else if near_vah
+        sell_vp_f := 1.0
+int sell_vp = int(sell_vp_f)
+
+// ============================================================================
+// 5 · VWAP SIDE
+// ============================================================================
+src = hlc3
+anc_tf = i_vwap_anc == "Week" ? "W" : i_vwap_anc == "Month" ? "M" : i_vwap_anc == "Quarter" ? "3M" : i_vwap_anc == "Year" ? "12M" : "M"
+anc_t  = time(anc_tf)
+is_new = na(anc_t[1]) or anc_t != anc_t[1]
+var float sumPV = 0.0
+var float sumV  = 0.0
+sumPV := (is_new ? 0.0 : sumPV) + src * volume
+sumV  := (is_new ? 0.0 : sumV)  + volume
+anc_vwap = sumV > 0 ? sumPV / sumV : na
+
+roll_pv   = math.sum(src * volume, i_vwap_len)
+roll_v    = math.sum(volume, i_vwap_len)
+roll_vwap = roll_v > 0 ? roll_pv / roll_v : na
+
+vwap_v   = i_vwap_anc == "Rolling" ? roll_vwap : anc_vwap
+buy_vwap  = i_vwap_on and not na(vwap_v) and close > vwap_v
+sell_vwap = i_vwap_on and not na(vwap_v) and close < vwap_v
+plot(i_vwap_on ? vwap_v : na, "VWAP", color = color.new(color.purple, 0), linewidth = 2)
+
+// ============================================================================
+// 6 · VOLUME IMBALANCE (order-flow pressure proxy)
+// ============================================================================
+buy_vol  = rng_bar > 0 ? volume * (close - low) / rng_bar : volume * 0.5
+sell_vol = rng_bar > 0 ? volume * (high - close) / rng_bar : volume * 0.5
+cum_buy  = math.sum(buy_vol,  i_vimb_len)
+cum_sell = math.sum(sell_vol, i_vimb_len)
+dom      = 1.0 + i_vimb_thr / 100.0
+buy_imb  = i_vimb_on and cum_buy  > cum_sell * dom
+sell_imb = i_vimb_on and cum_sell > cum_buy  * dom
+
+// ============================================================================
+// 8 · LIQUIDITY SWEEP
+// ============================================================================
+liq_hi = ta.highest(high[1], i_liq_len)
+liq_lo = ta.lowest(low[1],   i_liq_len)
+sell_sweep = high > liq_hi and close < liq_hi
+buy_sweep  = low  < liq_lo and close > liq_lo
+
+bool recent_sell_sweep = false
+bool recent_buy_sweep  = false
+for k = 0 to i_sweep_win - 1
+    if sell_sweep[k]
+        recent_sell_sweep := true
+    if buy_sweep[k]
+        recent_buy_sweep := true
+
+// ============================================================================
+// CONFLUENCE SCORE (max 9)
+// ============================================================================
+b_fvg = in_bull_fvg      ? 2 : 0
+b_ob  = in_bull_ob       ? 2 : 0
+b_vw  = buy_vwap         ? 1 : 0
+b_vi  = buy_imb          ? 1 : 0
+b_sw  = recent_buy_sweep ? 1 : 0
+buy_score = b_fvg + b_ob + buy_vp + b_vw + b_vi + b_sw
+
+s_fvg = in_bear_fvg       ? 2 : 0
+s_ob  = in_bear_ob        ? 2 : 0
+s_vw  = sell_vwap         ? 1 : 0
+s_vi  = sell_imb          ? 1 : 0
+s_sw  = recent_sell_sweep ? 1 : 0
+sell_score = s_fvg + s_ob + sell_vp + s_vw + s_vi + s_sw
+
+trend_ema  = ta.ema(close, i_trend_len)
+trend_bull = not i_trend_on or close > trend_ema
+trend_bear = not i_trend_on or close < trend_ema
+
+buy_zone  = in_bull_fvg or in_bull_ob
+sell_zone = in_bear_fvg or in_bear_ob
+
+buy_ok  = (not i_req_zone or buy_zone)  and buy_score  >= i_thr and trend_bull
+sell_ok = (not i_req_zone or sell_zone) and sell_score >= i_thr and trend_bear
+
+both     = buy_ok and sell_ok
+buy_sig  = buy_ok  and (not both or buy_score  > sell_score)
+sell_sig = sell_ok and (not both or sell_score > buy_score)
+
+// ============================================================================
+// RISK MODEL
+// ============================================================================
+recent_low  = ta.lowest(low,  i_ob_search)
+recent_high = ta.highest(high, i_ob_search)
+
+buy_entry = close
+buy_stop  = math.min(math.min(recent_low, nz(bull_ob_lo, recent_low)), nz(bull_fvg_lo, recent_low)) - atr * i_sl_atr
+sell_entry = close
+sell_stop  = math.max(math.max(recent_high, nz(bear_ob_hi, recent_high)), nz(bear_fvg_hi, recent_high)) + atr * i_sl_atr
+
+// ============================================================================
+// EXECUTION  (exits set once at entry; levels fixed)
+// ============================================================================
+flat       = strategy.position_size == 0
+long_cond  = i_longs  and buy_sig  and flat and in_window and (buy_entry - buy_stop)  > 0
+short_cond = i_shorts and sell_sig and flat and in_window and (sell_stop - sell_entry) > 0
+
+if long_cond
+    risk_per_unit = buy_entry - buy_stop
+    qty = (strategy.equity * i_risk_pct / 100.0) / risk_per_unit
+    strategy.entry("L", strategy.long, qty = qty)
+    strategy.exit("L-TP1", from_entry = "L", qty_percent = i_tp1_pct, stop = buy_stop, limit = buy_entry + risk_per_unit * i_tp1_rr)
+    strategy.exit("L-TP2", from_entry = "L", stop = buy_stop, limit = buy_entry + risk_per_unit * i_tp2_rr)
+
+if short_cond
+    risk_per_unit = sell_stop - sell_entry
+    qty = (strategy.equity * i_risk_pct / 100.0) / risk_per_unit
+    strategy.entry("S", strategy.short, qty = qty)
+    strategy.exit("S-TP1", from_entry = "S", qty_percent = i_tp1_pct, stop = sell_stop, limit = sell_entry - risk_per_unit * i_tp1_rr)
+    strategy.exit("S-TP2", from_entry = "S", stop = sell_stop, limit = sell_entry - risk_per_unit * i_tp2_rr)
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+plotshape(long_cond,  title = "Buy",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.small)
+plotshape(short_cond, title = "Sell", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.small)
+bgcolor(buy_sig ? color.new(color.green, 90) : sell_sig ? color.new(color.red, 90) : na)
+
+if barstate.islast and not timeframe.isdaily
+    label.new(bar_index, high, "⚠ Tuned for the 1D timeframe", style = label.style_label_down, color = color.new(color.orange, 0), textcolor = color.white, size = size.small, yloc = yloc.abovebar)

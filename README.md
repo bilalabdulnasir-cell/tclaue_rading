@@ -19,13 +19,32 @@ A signal only triggers when **enough of these agree** (a weighted score) **and**
 
 ## What's in here
 
+There are **two** independent systems in this repo. Pick one:
+
+### ⭐ Daily Swing Confluence (DSC) — the 1-Day system
+
+A **new, leaner 6-factor** engine built specifically for the **1-Day timeframe**. Use this if
+you want a focused daily swing strategy.
+
+| File | Purpose |
+|---|---|
+| [`indicators/daily_swing_confluence.pine`](indicators/daily_swing_confluence.pine) | **Indicator** — 6 factors, on-chart FVG/OB zones, Volume Profile (VAH/VAL/POC), VWAP, sweep markers, a live dashboard, BUY/SELL labels, and alerts. |
+| [`strategies/daily_swing_confluence_strategy.pine`](strategies/daily_swing_confluence_strategy.pine) | **Backtestable strategy** — the same engine wired to entries/exits, risk-based sizing, a fixed stop and a 2-stage scale-out. |
+| [`docs/DAILY_SWING_STRATEGY.md`](docs/DAILY_SWING_STRATEGY.md) | **The DSC playbook** — every factor, the scoring model, and the exact buy/sell rules. **Read this.** |
+
+DSC factors (max score **9**): **FVG Retest (2) · Order Block (2) · Volume Profile 1–2 · VWAP
+Side (1) · Volume Imbalance / order-flow (1) · Liquidity Sweep (1)**. Unlike the larger suite
+below, the Volume Profile is computed every bar, so it works in the backtest too.
+
+### Institutional Swing Suite (ISS) — the original 8-module system
+
 | File | Purpose |
 |---|---|
 | [`indicators/swing_institutional_suite.pine`](indicators/swing_institutional_suite.pine) | **Full visual indicator** — all 8 modules, on-chart zones, Volume Profile, a live dashboard, signal labels, and alerts. Use this to *read* the chart and get alerts. |
 | [`strategies/swing_institutional_strategy.pine`](strategies/swing_institutional_strategy.pine) | **Backtestable strategy** — the same confluence engine wired to entries/exits, risk-based sizing, a fixed stop and a 2-stage scale-out. Use this to *validate* on historical data. |
-| [`docs/STRATEGY.md`](docs/STRATEGY.md) | **The playbook** — the deep "why" behind every module, the scoring model, and the exact rules for entries, stops, targets, and risk. **Read this.** |
+| [`docs/STRATEGY.md`](docs/STRATEGY.md) | **The playbook** — the deep "why" behind every module, the scoring model, and the exact rules for entries, stops, targets, and risk. |
 
-The strategy omits Volume Profile (too heavy to compute reliably inside a backtest engine), so its max score is 12 vs. the indicator's 13. Everything else matches.
+The ISS strategy omits Volume Profile (too heavy to compute reliably inside a backtest engine), so its max score is 12 vs. the indicator's 13. Everything else matches.
 
 ---
 
