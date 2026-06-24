@@ -100,8 +100,12 @@ ltfV = request.security_lower_tf(syminfo.tickerid, i_of_ltf, volume, ignore_inva
 
 float buyVol  = 0.0
 float sellVol = 0.0
-int   nIntra  = array.size(ltfV)
-if nIntra > 0
+// request.security_lower_tf can return `na` (not an empty array) when intrabar
+// data is unavailable (e.g. bar 0, or history beyond the intrabar limit), so we
+// must test for na BEFORE calling any array method.
+int  nIntra  = na(ltfV) ? 0 : array.size(ltfV)
+bool haveLtf = nIntra > 0 and not na(ltfO) and not na(ltfC)
+if haveLtf
     for i = 0 to nIntra - 1
         v = array.get(ltfV, i)
         c = array.get(ltfC, i)
