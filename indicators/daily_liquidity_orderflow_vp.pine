@@ -1,0 +1,337 @@
+//@version=6
+// ============================================================================
+//  DAILY LIQUIDITY SWEEP + ORDER FLOW + VOLUME PROFILE   (LS · OF · VP)
+//  A simple, modern "smart-money" entry/exit model for the DAILY timeframe.
+//
+//  THREE PILLARS — all three must agree before an institutional-grade entry:
+//    1. LIQUIDITY SWEEP  - price runs a prior swing high/low to grab stops,
+//                          then *reclaims* it (a stop-hunt / trap reversal).
+//                          This is where desks fill against trapped traders.
+//    2. ORDER FLOW       - intrabar volume delta (buy vol - sell vol) pulled
+//                          from a lower timeframe via request.security_lower_tf.
+//                          Confirms WHO is actually in control on the sweep.
+//    3. VOLUME PROFILE   - POC / Value-Area High-Low (volume-at-price). Entries
+//                          are only taken from a "value" location (discount for
+//                          longs, premium for shorts); the opposite value edge
+//                          is the logical target.
+//
+//  ENTRY  : sweep + matching order flow + correct value location -> LONG / SHORT.
+//  EXIT   : stop beyond the sweep, target at the opposite value edge / R-multiple,
+//           or an opposite sweep (flip). One position at a time, so the chart
+//           reads as a clean sequence of institutional entries and exits.
+//
+//  Built and tuned for the Daily timeframe. Educational tool — not financial
+//  advice and not a guarantee of profit. Backtest before risking capital.
+// ============================================================================
+indicator("Daily Liquidity Sweep + Order Flow + Volume Profile", "LS·OF·VP", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+var string G_LIQ = "1 · Liquidity Sweep"
+var string G_OF  = "2 · Order Flow (volume delta)"
+var string G_VP  = "3 · Volume Profile"
+var string G_SIG = "4 · Entry / Exit"
+var string G_DSP = "Display"
+
+// 1 · Liquidity
+i_sw_len    = input.int(20, "Swing Lookback (bars)", group = G_LIQ, minval = 3, tooltip = "How far back to find the swing high/low whose resting stops get swept.")
+i_sw_win    = input.int(3,  "Sweep-to-Entry Window (bars)", group = G_LIQ, minval = 1, maxval = 10, tooltip = "A sweep stays 'fresh' (tradable) for this many bars while we wait for flow + location to align.")
+
+// 2 · Order flow
+i_of_ltf    = input.timeframe("60", "Order-Flow Lower Timeframe", group = G_OF, tooltip = "Intrabars used to estimate buy vs sell volume (delta). MUST be lower than the chart TF. For a Daily chart, 60 (1H) is a good default. If unavailable, the script falls back to a close-position estimate.")
+i_of_smooth = input.int(3, "Delta Smoothing (EMA)", group = G_OF, minval = 1, tooltip = "Smooths the per-bar delta so a single noisy bar doesn't flip the flow read.")
+
+// 3 · Volume profile
+i_vp_look   = input.int(120, "Profile Lookback (bars)", group = G_VP, minval = 20, maxval = 300, tooltip = "Bars used to build the volume-at-price profile. Computed every bar, so keep it modest on the Daily TF.")
+i_vp_rows   = input.int(24,  "Profile Rows (resolution)", group = G_VP, minval = 10, maxval = 60)
+i_vp_va     = input.float(70.0, "Value Area %", group = G_VP, minval = 50, maxval = 90, step = 5)
+
+// 4 · Signals
+i_sl_atr    = input.float(0.5, "Stop Buffer (x ATR)", group = G_SIG, minval = 0.0, step = 0.1, tooltip = "Padding placed beyond the sweep extreme for the protective stop.")
+i_tp_rr     = input.float(2.0, "Fallback Target (R multiple)", group = G_SIG, minval = 0.5, step = 0.5, tooltip = "Used when the opposite value-area edge does not give a sensible target.")
+i_longs     = input.bool(true, "Allow Longs", group = G_SIG)
+i_shorts    = input.bool(true, "Allow Shorts", group = G_SIG)
+
+// Display
+i_show_vp   = input.bool(true, "Show Volume Profile levels", group = G_DSP)
+i_show_sw   = input.bool(true, "Show sweep markers", group = G_DSP)
+i_show_pan  = input.bool(true, "Show dashboard", group = G_DSP)
+
+// ----------------------------------------------------------------------------
+// CORE
+// ----------------------------------------------------------------------------
+atr = ta.atr(14)
+
+// ----------------------------------------------------------------------------
+// 1 · LIQUIDITY SWEEP (stop-hunt + reclaim)
+//     Bull sweep : trades below the prior swing low, then closes back above it.
+//     Bear sweep : trades above the prior swing high, then closes back below it.
+// ----------------------------------------------------------------------------
+swingHi = ta.highest(high[1], i_sw_len)
+swingLo = ta.lowest(low[1],   i_sw_len)
+
+bullSweep = low  < swingLo and close > swingLo and close > open
+bearSweep = high > swingHi and close < swingHi and close < open
+
+var int   lastBullBar  = na
+var int   lastBearBar  = na
+var float bullSweepLow = na
+var float bearSweepHigh = na
+if bullSweep
+    lastBullBar  := bar_index
+    bullSweepLow := low
+if bearSweep
+    lastBearBar   := bar_index
+    bearSweepHigh := high
+
+freshBull = not na(lastBullBar) and (bar_index - lastBullBar) <= i_sw_win
+freshBear = not na(lastBearBar) and (bar_index - lastBearBar) <= i_sw_win
+
+// ----------------------------------------------------------------------------
+// 2 · ORDER FLOW — intrabar volume delta (modern, via request.security_lower_tf)
+//     Pull lower-timeframe candles inside each daily bar and classify their
+//     volume as buying (close >= open) or selling (close < open). The signed
+//     sum is the bar's order-flow delta; its EMA is the directional read.
+// ----------------------------------------------------------------------------
+ltfO = request.security_lower_tf(syminfo.tickerid, i_of_ltf, open,   ignore_invalid_timeframe = true)
+ltfC = request.security_lower_tf(syminfo.tickerid, i_of_ltf, close,  ignore_invalid_timeframe = true)
+ltfV = request.security_lower_tf(syminfo.tickerid, i_of_ltf, volume, ignore_invalid_timeframe = true)
+
+float buyVol  = 0.0
+float sellVol = 0.0
+int   nIntra  = array.size(ltfV)
+if nIntra > 0
+    for i = 0 to nIntra - 1
+        v = array.get(ltfV, i)
+        c = array.get(ltfC, i)
+        o = array.get(ltfO, i)
+        if not na(v) and not na(c) and not na(o)
+            if c >= o
+                buyVol += v
+            else
+                sellVol += v
+else
+    // Fallback when no intrabar data: split the bar's volume by where it closed
+    // inside its range (close near high = net buying, near low = net selling).
+    rng  = high - low
+    frac = rng > 0 ? ((close - low) - (high - close)) / rng : 0.0
+    if frac >= 0
+        buyVol  := volume * frac
+    else
+        sellVol := volume * (-frac)
+
+barDelta = buyVol - sellVol
+deltaEma = ta.ema(nz(barDelta), i_of_smooth)
+
+bullFlow = deltaEma > 0   // net buyers in control
+bearFlow = deltaEma < 0   // net sellers in control
+
+// ----------------------------------------------------------------------------
+// 3 · VOLUME PROFILE — POC / VAH / VAL over a rolling lookback (computed each
+//     bar so the entry logic can use it historically).
+// ----------------------------------------------------------------------------
+var float pocPrice = na
+var float vahPrice = na
+var float valPrice = na
+
+hh  = ta.highest(high, i_vp_look)
+ll  = ta.lowest(low,   i_vp_look)
+rng = hh - ll
+if not na(rng) and rng > 0 and bar_index >= i_vp_look
+    rows = i_vp_rows
+    step = rng / rows
+    bins = array.new<float>(rows, 0.0)
+    // Distribute each bar's volume across the price bins it spanned.
+    for k = 0 to i_vp_look - 1
+        bl = low[k]
+        bh = high[k]
+        bv = volume[k]
+        if not na(bl) and not na(bh) and not na(bv) and bv > 0
+            loi  = int(math.max(0, math.min(rows - 1, math.floor((bl - ll) / step))))
+            hii  = int(math.max(0, math.min(rows - 1, math.floor((bh - ll) / step))))
+            span = hii - loi + 1
+            per  = bv / span
+            for bi = loi to hii
+                array.set(bins, bi, array.get(bins, bi) + per)
+    // Point of Control = most-traded bin.
+    pocIdx = 0
+    maxV   = 0.0
+    totV   = 0.0
+    for bi = 0 to rows - 1
+        v = array.get(bins, bi)
+        totV += v
+        if v > maxV
+            maxV   := v
+            pocIdx := bi
+    // Expand outward from the POC until ~VA% of volume is captured.
+    vaTarget = totV * i_vp_va / 100.0
+    acc = maxV
+    up  = pocIdx
+    dn  = pocIdx
+    while acc < vaTarget and (up < rows - 1 or dn > 0)
+        upV = up < rows - 1 ? array.get(bins, up + 1) : -1.0
+        dnV = dn > 0        ? array.get(bins, dn - 1) : -1.0
+        if upV >= dnV
+            up  += 1
+            acc += math.max(upV, 0)
+        else
+            dn  -= 1
+            acc += math.max(dnV, 0)
+    pocPrice := ll + (pocIdx + 0.5) * step
+    vahPrice := ll + (up + 1) * step
+    valPrice := ll + dn * step
+
+// Value location: long only from discount (at/below POC), short only from premium.
+longLoc  = not na(pocPrice) and close <= pocPrice
+shortLoc = not na(pocPrice) and close >= pocPrice
+
+// Draw the live profile levels (last bar only — keeps the chart clean).
+var line  pocLn = na
+var line  vahLn = na
+var line  valLn = na
+var label pocLb = na
+if i_show_vp and barstate.islast and not na(pocPrice)
+    lft = bar_index - i_vp_look
+    line.delete(pocLn)
+    line.delete(vahLn)
+    line.delete(valLn)
+    label.delete(pocLb)
+    pocLn := line.new(lft, pocPrice, bar_index + 8, pocPrice, color = color.new(color.orange, 0), width = 2)
+    vahLn := line.new(lft, vahPrice, bar_index + 8, vahPrice, color = color.new(color.blue, 30), style = line.style_dashed)
+    valLn := line.new(lft, valPrice, bar_index + 8, valPrice, color = color.new(color.blue, 30), style = line.style_dashed)
+    pocLb := label.new(bar_index + 8, pocPrice, "POC", style = label.style_label_left, color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+
+// ----------------------------------------------------------------------------
+// ENTRY / EXIT STATE MACHINE (one position at a time)
+// ----------------------------------------------------------------------------
+canLong  = i_longs  and freshBull and bullFlow and longLoc
+canShort = i_shorts and freshBear and bearFlow and shortLoc
+
+var int    posDir   = 0      // 1 long, -1 short, 0 flat
+var float  entryP   = na
+var float  stopP    = na
+var float  tpP      = na
+
+bool   longEntry  = false
+bool   shortEntry = false
+bool   exitNow    = false
+string exitReason = na
+
+if posDir == 0
+    if canLong
+        entryP := close
+        stopP  := math.min(nz(bullSweepLow, low), low) - atr * i_sl_atr
+        risk   = entryP - stopP
+        rrT    = entryP + risk * i_tp_rr
+        // Target = opposite value edge (VAH) if it sits above entry, else R-based.
+        tpP       := not na(vahPrice) and vahPrice > entryP ? math.max(vahPrice, entryP + risk) : rrT
+        posDir    := 1
+        longEntry := true
+        lastBullBar := na          // consume the sweep so we don't re-enter on it
+    else if canShort
+        entryP := close
+        stopP  := math.max(nz(bearSweepHigh, high), high) + atr * i_sl_atr
+        risk   = stopP - entryP
+        rrT    = entryP - risk * i_tp_rr
+        tpP        := not na(valPrice) and valPrice < entryP ? math.min(valPrice, entryP - risk) : rrT
+        posDir     := -1
+        shortEntry := true
+        lastBearBar := na
+else if posDir == 1
+    if low <= stopP
+        exitReason := "SL"
+        exitNow    := true
+    else if bearSweep
+        exitReason := "FLIP"
+        exitNow    := true
+    else if high >= tpP
+        exitReason := "TP"
+        exitNow    := true
+    if exitNow
+        posDir := 0
+else if posDir == -1
+    if high >= stopP
+        exitReason := "SL"
+        exitNow    := true
+    else if bullSweep
+        exitReason := "FLIP"
+        exitNow    := true
+    else if low <= tpP
+        exitReason := "TP"
+        exitNow    := true
+    if exitNow
+        posDir := 0
+
+// ----------------------------------------------------------------------------
+// VISUALS
+// ----------------------------------------------------------------------------
+plotshape(i_show_sw and bullSweep, "Bull Sweep", shape.triangleup,   location.belowbar, color.new(color.teal, 0),   size = size.tiny)
+plotshape(i_show_sw and bearSweep, "Bear Sweep", shape.triangledown, location.abovebar, color.new(color.maroon, 0), size = size.tiny)
+
+f_drawTrade(_isLong, _e, _s, _t) =>
+    col = _isLong ? color.green : color.red
+    label.new(bar_index, _isLong ? low : high, _isLong ? "LONG" : "SHORT", style = _isLong ? label.style_label_up : label.style_label_down, color = color.new(col, 0), textcolor = color.white, yloc = _isLong ? yloc.belowbar : yloc.abovebar, size = size.small)
+    line.new(bar_index, _e, bar_index + 10, _e, color = color.new(color.gray, 0), width = 1)
+    line.new(bar_index, _s, bar_index + 10, _s, color = color.new(color.red, 0), width = 1)
+    line.new(bar_index, _t, bar_index + 10, _t, color = color.new(color.green, 0), style = line.style_dashed)
+
+if longEntry
+    f_drawTrade(true, entryP, stopP, tpP)
+if shortEntry
+    f_drawTrade(false, entryP, stopP, tpP)
+if exitNow
+    label.new(bar_index, close, "EXIT " + exitReason, style = label.style_label_left, color = color.new(color.gray, 10), textcolor = color.white, size = size.tiny)
+
+bgcolor(posDir == 1 ? color.new(color.green, 92) : posDir == -1 ? color.new(color.red, 92) : na, title = "Open position")
+
+// ----------------------------------------------------------------------------
+// DASHBOARD
+// ----------------------------------------------------------------------------
+var table dash = table.new(position.top_right, 3, 8, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50), border_color = color.new(color.gray, 60))
+f_cell(_c, _r, _t, _bg) => table.cell(dash, _c, _r, _t, text_color = color.white, bgcolor = _bg, text_size = size.small)
+f_yn(_b) => _b ? color.new(color.green, 30) : color.new(color.red, 55)
+
+if i_show_pan and barstate.islast
+    nv = color.new(color.navy, 0)
+    gy = color.new(color.gray, 70)
+    bk = color.new(color.black, 20)
+    f_cell(0, 0, "PILLAR", nv)
+    f_cell(1, 0, "LONG", color.new(color.green, 20))
+    f_cell(2, 0, "SHORT", color.new(color.red, 20))
+
+    f_cell(0, 1, "1 · Liquidity sweep", gy)
+    f_cell(1, 1, freshBull ? "YES" : "-", f_yn(freshBull))
+    f_cell(2, 1, freshBear ? "YES" : "-", f_yn(freshBear))
+
+    f_cell(0, 2, "2 · Order flow (Δ " + str.tostring(math.round(deltaEma)) + ")", gy)
+    f_cell(1, 2, bullFlow ? "BUY" : "-", f_yn(bullFlow))
+    f_cell(2, 2, bearFlow ? "SELL" : "-", f_yn(bearFlow))
+
+    f_cell(0, 3, "3 · VP location", gy)
+    f_cell(1, 3, longLoc ? "DISC" : "-", f_yn(longLoc))
+    f_cell(2, 3, shortLoc ? "PREM" : "-", f_yn(shortLoc))
+
+    f_cell(0, 4, "SETUP READY", nv)
+    f_cell(1, 4, canLong ? "LONG" : "-", canLong ? color.new(color.green, 0) : gy)
+    f_cell(2, 4, canShort ? "SHORT" : "-", canShort ? color.new(color.red, 0) : gy)
+
+    posTxt = posDir == 1 ? "LONG" : posDir == -1 ? "SHORT" : "FLAT"
+    f_cell(0, 5, "POSITION", nv)
+    f_cell(1, 5, posTxt, posDir == 1 ? color.new(color.green, 0) : posDir == -1 ? color.new(color.red, 0) : gy)
+    f_cell(2, 5, posDir != 0 ? "@ " + str.tostring(entryP, format.mintick) : "-", bk)
+
+    f_cell(0, 6, "STOP / TARGET", nv)
+    f_cell(1, 6, posDir != 0 ? str.tostring(stopP, format.mintick) : "-", bk)
+    f_cell(2, 6, posDir != 0 ? str.tostring(tpP, format.mintick) : "-", bk)
+
+    f_cell(0, 7, "POC / VAH", gy)
+    f_cell(1, 7, not na(pocPrice) ? str.tostring(pocPrice, format.mintick) : "-", bk)
+    f_cell(2, 7, not na(vahPrice) ? str.tostring(vahPrice, format.mintick) : "-", bk)
+
+// ----------------------------------------------------------------------------
+// ALERTS
+// ----------------------------------------------------------------------------
+alertcondition(longEntry,  "LS·OF·VP · Long Entry",  "LONG {{ticker}} {{interval}} @ {{close}} — liquidity sweep + buy order-flow + discount (POC)")
+alertcondition(shortEntry, "LS·OF·VP · Short Entry", "SHORT {{ticker}} {{interval}} @ {{close}} — liquidity sweep + sell order-flow + premium (POC)")
+alertcondition(exitNow,    "LS·OF·VP · Exit",        "EXIT {{ticker}} {{interval}} @ {{close}}")
